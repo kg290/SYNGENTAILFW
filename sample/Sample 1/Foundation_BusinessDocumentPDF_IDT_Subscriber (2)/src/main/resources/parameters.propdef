@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?><parameters><parameter>
+    <key/>
+    <name>Bucket Name</name>
+    <type>xsd:string</type>
+    <isRequired>false</isRequired>
+    <constraint/>
+    <description/>
+    <additionalMetadata/>
+  </parameter><parameter>
+    <key/>
+    <name>AccessKey</name>
+    <type>xsd:string</type>
+    <isRequired>false</isRequired>
+    <constraint/>
+    <description/>
+    <additionalMetadata/>
+  </parameter><parameter>
+    <key/>
+    <name>SecretKey</name>
+    <type>xsd:string</type>
+    <isRequired>false</isRequired>
+    <constraint/>
+    <description/>
+    <additionalMetadata/>
+  </parameter><parameter>
+    <key/>
+    <name>SynLogisticsPlatform_Database</name>
+    <type>xsd:string</type>
+    <isRequired>false</isRequired>
+    <constraint/>
+    <description/>
+    <additionalMetadata/>
+  </parameter><param_references><reference attribute_category="AWS-S3" attribute_id="ctype::Adapter/cname::AmazonWebServices/vendor::rojoconsultancy.com/version::1.1.0/attrId::bucketName" attribute_uilabel="Bucket Name" param_key="Bucket Name"/><reference attribute_category="AWS-S3" attribute_id="ctype::Adapter/cname::AmazonWebServices/vendor::rojoconsultancy.com/version::1.1.0/attrId::secretKey" attribute_uilabel="Secret Key Alias" param_key="SecretKey"/><reference attribute_category="AWS-S3" attribute_id="ctype::Adapter/cname::AmazonWebServices/vendor::rojoconsultancy.com/version::1.1.0/attrId::accessKey" attribute_uilabel="Access Key Alias" param_key="AccessKey"/><reference attribute_category="SynLogisticsPlatform_Database.Auth" attribute_id="ctype::Adapter/cname::JDBC/vendor::SAP/version::1.5.3/attrId::alias" attribute_uilabel="JDBC Data Source Alias" param_key="SynLogisticsPlatform_Database"/></param_references></parameters>

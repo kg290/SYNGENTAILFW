@@ -1,0 +1,6 @@
+#
+#Fri Mar 20 12:25:02 UTC 2026
+SecretKey=Secret_Key_AWS_S3_Bravo
+SynLogisticsPlatform_Database=LogisticsPlatform
+Bucket\ Name=idt-test-document-data
+AccessKey=Access_Key_AWS_S3_Bravo
