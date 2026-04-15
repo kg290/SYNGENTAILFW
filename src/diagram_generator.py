@@ -9,6 +9,7 @@ Uses matplotlib for vector graphics output.
 
 import io
 import logging
+import re
 from collections import deque
 from pathlib import Path
 import textwrap
@@ -37,6 +38,16 @@ class BPMNDiagramGenerator:
     LIGHT_GRAY = '#F5F5F5'
     WHITE = '#FFFFFF'
 
+    # SAP CPI-like styling tokens used by the BPMN-DI renderer.
+    SAP_TASK_FILL = '#EAF5FF'
+    SAP_TASK_EDGE = '#87B1D8'
+    SAP_TEXT = '#2F4D69'
+    SAP_POOL_BG = '#F8FAFC'
+    SAP_POOL_EDGE = '#C1CAD4'
+    SAP_LANE_BG = '#EFF3F7'
+    SAP_SEQ_FLOW = '#6087AD'
+    SAP_MSG_FLOW = '#92A8BD'
+
     BPMN_NS = {
         'bpmn2': 'http://www.omg.org/spec/BPMN/20100524/MODEL',
         'bpmndi': 'http://www.omg.org/spec/BPMN/20100524/DI',
@@ -48,6 +59,7 @@ class BPMNDiagramGenerator:
     def __init__(self, iflow_name: str, dpi: int = 220):
         self.iflow_name = iflow_name
         self.dpi = dpi
+        self._runtime_parameters: Dict[str, str] = {}
 
     @staticmethod
     def _truncate_label(value: str, max_len: int = 22) -> str:
@@ -123,13 +135,91 @@ class BPMNDiagramGenerator:
 
         marker = Rectangle(
             (marker_x, marker_y), marker_w, marker_h,
-            facecolor='#FFFFFF', edgecolor='#666666', linewidth=0.8, zorder=7
+            facecolor='#FFFFFF', edgecolor='#73889D', linewidth=0.75, zorder=7
         )
         ax.add_patch(marker)
         ax.plot([center_x - marker_w * 0.2, center_x + marker_w * 0.2], [marker_y + marker_h / 2] * 2,
-                color='#666666', linewidth=0.8, zorder=8)
+            color='#73889D', linewidth=0.8, zorder=8)
         ax.plot([center_x, center_x], [marker_y + marker_h * 0.3, marker_y + marker_h * 0.7],
-                color='#666666', linewidth=0.8, zorder=8)
+            color='#73889D', linewidth=0.8, zorder=8)
+
+    @staticmethod
+    def _draw_task_activity_marker(ax, center_x: float, bottom_y: float, width: float):
+        """Draw a compact activity marker under task nodes for SAP-style look."""
+        marker_w = min(7.2, max(5.0, width * 0.055))
+        marker_h = marker_w * 0.78
+        marker_x = center_x - marker_w / 2
+        marker_y = bottom_y - marker_h
+        marker = Rectangle(
+            (marker_x, marker_y), marker_w, marker_h,
+            facecolor='#FFFFFF', edgecolor='#97B2CB', linewidth=0.65, zorder=7
+        )
+        ax.add_patch(marker)
+        ax.plot(
+            [marker_x + marker_w * 0.18, marker_x + marker_w * 0.82],
+            [marker_y + marker_h * 0.52, marker_y + marker_h * 0.52],
+            color='#8CA9C3',
+            linewidth=0.6,
+            zorder=8,
+        )
+
+    @staticmethod
+    def _draw_task_corner_icon(ax, x: float, y: float):
+        """Draw a tiny document-like glyph in task corner."""
+        icon_w = 4.4
+        icon_h = 4.0
+        left = x + 3.0
+        top = y + 3.0
+        icon = Rectangle(
+            (left, top),
+            icon_w,
+            icon_h,
+            facecolor='#FFFFFF',
+            edgecolor='#8EAED0',
+            linewidth=0.6,
+            zorder=8,
+        )
+        ax.add_patch(icon)
+        ax.plot(
+            [left + icon_w * 0.68, left + icon_w * 0.95, left + icon_w * 0.95],
+            [top, top, top + icon_h * 0.28],
+            color='#8EAED0',
+            linewidth=0.55,
+            zorder=9,
+        )
+
+    @staticmethod
+    def _draw_gateway_marker(ax, cx: float, cy: float, element_type: str):
+        """Draw BPMN gateway marker inside gateway diamond."""
+        marker = element_type.lower()
+        size = 2.9
+        color = '#4D6F90'
+
+        if 'parallel' in marker:
+            ax.plot([cx - size, cx + size], [cy, cy], color=color, linewidth=1.3, zorder=7)
+            ax.plot([cx, cx], [cy - size, cy + size], color=color, linewidth=1.3, zorder=7)
+            return
+
+        if 'inclusive' in marker:
+            inner = Circle((cx, cy), radius=2.7, facecolor='none', edgecolor=color, linewidth=1.2, zorder=7)
+            ax.add_patch(inner)
+            return
+
+        # Default/exclusive marker.
+        ax.plot([cx - size, cx + size], [cy - size, cy + size], color=color, linewidth=1.1, zorder=7)
+        ax.plot([cx - size, cx + size], [cy + size, cy - size], color=color, linewidth=1.1, zorder=7)
+
+    @staticmethod
+    def _draw_message_envelope(ax, x: float, y: float, color: str):
+        """Draw a tiny envelope icon near the start of message flows."""
+        w, h = 4.6, 3.2
+        left = x - (w / 2)
+        top = y - (h / 2)
+        env = Rectangle((left, top), w, h, facecolor='#FFFFFF', edgecolor=color, linewidth=0.72, zorder=6)
+        ax.add_patch(env)
+        ax.plot([left, left + (w / 2), left + w], [top, top + h * 0.58, top], color=color, linewidth=0.7, zorder=7)
+        ax.plot([left, left + (w / 2)], [top + h, top + h * 0.54], color=color, linewidth=0.55, zorder=7)
+        ax.plot([left + w, left + (w / 2)], [top + h, top + h * 0.54], color=color, linewidth=0.55, zorder=7)
 
     def _collect_element_metadata(self, root: ET.Element) -> Dict[str, Dict[str, str]]:
         """Collect BPMN element type/name keyed by element id."""
@@ -195,6 +285,379 @@ class BPMNDiagramGenerator:
             if len(points) >= 2:
                 edges[flow_id] = points
         return edges
+
+    @staticmethod
+    def _normalize_lookup_key(value: str) -> str:
+        """Normalize property keys to robust lookup tokens."""
+        return re.sub(r'[^a-z0-9]+', '', str(value or '').strip().lower())
+
+    def _resolve_runtime_placeholders(self, value: str) -> str:
+        """Resolve ${...} and {{...}} placeholders from runtime parameter files."""
+        raw = str(value or '').strip()
+        if not raw:
+            return ""
+
+        pattern = re.compile(r'\$\{([^}]+)\}|\{\{([^}]+)\}\}')
+
+        def replacer(match: re.Match[str]) -> str:
+            key = (match.group(1) or match.group(2) or '').replace('\\ ', ' ').strip()
+            if not key:
+                return match.group(0)
+            resolved = self._runtime_parameters.get(self._normalize_lookup_key(key), '')
+            return resolved if resolved else match.group(0)
+
+        return pattern.sub(replacer, raw)
+
+    def _load_runtime_parameters(self, parser) -> None:
+        """Load project parameter values near the iFlow for placeholder resolution."""
+        self._runtime_parameters = {}
+        iflow_path = getattr(parser, 'iflow_path', None)
+        if not iflow_path:
+            return
+
+        try:
+            flow_path = Path(iflow_path)
+        except Exception:
+            return
+
+        if not flow_path.exists():
+            return
+
+        candidates: List[Path] = []
+        max_depth = min(7, len(flow_path.parents))
+        for idx in range(max_depth):
+            parent = flow_path.parents[idx]
+            candidates.append(parent / 'parameters.prop')
+            candidates.append(parent / 'parameters.propdef')
+
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                content = candidate.read_text(encoding='utf-8')
+            except Exception:
+                continue
+
+            for line in content.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#') or '=' not in stripped:
+                    continue
+                key, value = stripped.split('=', 1)
+                key = key.replace('\\ ', ' ').strip()
+                lookup = self._normalize_lookup_key(key)
+                if not lookup:
+                    continue
+                if lookup not in self._runtime_parameters:
+                    self._runtime_parameters[lookup] = value.strip()
+
+    def _properties_to_map(self, properties: List[List[str]]) -> Dict[str, str]:
+        """Convert list-based key/value properties to a normalized dictionary."""
+        normalized: Dict[str, str] = {}
+        for key, value in properties:
+            lookup = self._normalize_lookup_key(str(key or '').strip())
+            if not lookup:
+                continue
+            rendered = self._resolve_runtime_placeholders(str(value or '').strip())
+            if lookup not in normalized:
+                normalized[lookup] = rendered
+            elif not normalized[lookup] and rendered:
+                normalized[lookup] = rendered
+        return normalized
+
+    def _pick_property(self, prop_map: Dict[str, str], keys: List[str]) -> str:
+        """Pick first non-empty property value from normalized keys."""
+        for key in keys:
+            lookup = self._normalize_lookup_key(key)
+            if not lookup:
+                continue
+            value = prop_map.get(lookup, '').strip()
+            if value:
+                return value
+        return ""
+
+    def _pick_property_with_key(self, prop_map: Dict[str, str], keys: List[str]) -> Tuple[str, str]:
+        """Pick first non-empty property and return normalized key + value."""
+        for key in keys:
+            lookup = self._normalize_lookup_key(key)
+            if not lookup:
+                continue
+            value = prop_map.get(lookup, '').strip()
+            if value:
+                return lookup, value
+        return '', ''
+
+    def _enrich_variant_properties(self, prop_map: Dict[str, str]) -> None:
+        """Derive adapter details from cmdVariantUri when explicit keys are missing."""
+        variant_uri = self._pick_property(prop_map, ['cmd variant uri', 'cmdvarianturi'])
+        if not variant_uri:
+            return
+
+        parts: Dict[str, str] = {}
+        for segment in variant_uri.split('/'):
+            if '::' not in segment:
+                continue
+            seg_key, seg_value = segment.split('::', 1)
+            key_norm = self._normalize_lookup_key(seg_key)
+            if key_norm and seg_value:
+                parts[key_norm] = seg_value.strip()
+
+        cname = parts.get('cname', '').strip()
+        if cname and 'componenttype' not in prop_map:
+            prop_map['componenttype'] = cname.split(':')[-1]
+
+        tp = parts.get('tp', '').strip()
+        if tp and 'transportprotocol' not in prop_map:
+            prop_map['transportprotocol'] = tp
+
+        mp = parts.get('mp', '').strip()
+        if mp and 'messageprotocol' not in prop_map:
+            prop_map['messageprotocol'] = mp
+
+        vendor = parts.get('vendor', '').strip()
+        if vendor and 'vendor' not in prop_map:
+            prop_map['vendor'] = vendor
+
+        version = parts.get('version', '').strip()
+        if version and 'adapterversion' not in prop_map:
+            prop_map['adapterversion'] = version
+
+        direction = parts.get('direction', '').strip()
+        if direction and 'direction' not in prop_map:
+            prop_map['direction'] = direction
+
+    def _build_adapter_panel(self, properties: List[List[str]], direction: str) -> Dict[str, Any]:
+        """Build sender/receiver side-panel title and rows from adapter properties."""
+        prop_map = self._properties_to_map(properties)
+        self._enrich_variant_properties(prop_map)
+
+        adapter_name = self._pick_property(prop_map, ['component type', 'adapter type', 'name', 'message protocol'])
+        system_name = self._pick_property(prop_map, ['system'])
+        direction_key = direction.lower()
+
+        rows: List[Tuple[str, str]] = []
+        used_keys: set[str] = set()
+
+        def add_row(label: str, keys: List[str]) -> None:
+            picked_key, picked_value = self._pick_property_with_key(prop_map, keys)
+            if picked_key and picked_value:
+                rows.append((label, picked_value))
+                used_keys.add(picked_key)
+
+        if direction_key == 'sender':
+            title = f"Sender Adapter ({adapter_name})" if adapter_name else "Sender Adapter"
+            subtitle = system_name if system_name else "Not configured"
+            subtitle_label = 'System'
+            add_row('Adapter Type', ['component type', 'adapter type', 'name'])
+            add_row('Address', ['address', 'url path', 'urlpath', 'endpoint address', 'path'])
+            add_row('Service Definition', ['service definition', 'service interface', 'service'])
+            add_row('Transport Protocol', ['transport protocol', 'protocol'])
+            add_row('Use WS-Addressing', ['use ws-addressing', 'use ws addressing', 'usewsaddressing', 'use w s addressing'])
+            add_row('Message Exchange Pattern', ['message exchange pattern', 'message exchange'])
+            add_row('Authorization', ['sender auth type', 'authorization', 'authentication'])
+            add_row('User Role', ['user role'])
+            add_row('Quality Of Service', ['quality of service', 'qos'])
+        else:
+            receiver_name = self._pick_property(prop_map, ['name']) or self.iflow_name
+            receiver_id = self._pick_property(prop_map, ['id']) or self.iflow_name
+            title = f"Receiver Adapter ({adapter_name})" if adapter_name else "Receiver Configuration"
+            subtitle = system_name if system_name else "Integration Flow"
+            subtitle_label = 'Context'
+            rows.append(('Name', receiver_name))
+            rows.append(('ID', receiver_id))
+            add_row('Description', ['description'])
+            add_row('Adapter Type', ['component type', 'adapter type', 'name'])
+            add_row('Address', ['address', 'url path', 'urlpath', 'endpoint address'])
+            add_row('Authentication', ['authentication'])
+            add_row('Message Protocol', ['message protocol'])
+            add_row('Transport Protocol', ['transport protocol', 'protocol'])
+            add_row('Operation', ['operation name', 'operation', 's3 receiver operation'])
+            add_row('Bucket Name', ['s3 receiver bucket name', 'bucket name', 'bucketname'])
+
+        skip_keys = {
+            self._normalize_lookup_key(name)
+            for name in [
+                'direction',
+                'cmd variant uri',
+                'component version',
+                'message protocol version',
+                'transport protocol version',
+                'component swcv id',
+                'component swcv name',
+                'component ns',
+                'component id',
+                'vendor',
+            ]
+        }
+
+        if len(rows) < 9:
+            for key, value in properties:
+                if len(rows) >= 9:
+                    break
+                lookup = self._normalize_lookup_key(str(key or '').strip())
+                if not lookup or lookup in used_keys or lookup in skip_keys:
+                    continue
+                rendered = self._resolve_runtime_placeholders(str(value or '').strip())
+                if rendered:
+                    key_label = self._truncate_label(str(key), max_len=20)
+                    rows.append((key_label, rendered))
+                    used_keys.add(lookup)
+
+        if not rows:
+            rows = [('Status', 'No adapter details found')]
+
+        return {
+            'title': title,
+            'subtitle': subtitle,
+            'subtitle_label': subtitle_label,
+            'rows': rows[:9],
+        }
+
+    def _wrap_panel_text(self, value: str, width: int, max_lines: int) -> List[str]:
+        """Wrap panel text into multiple lines while keeping compact row height."""
+        normalized = str(value or '').replace('\n', ' ').strip()
+        if not normalized:
+            return [""]
+
+        lines = textwrap.wrap(
+            normalized,
+            width=max(6, width),
+            break_long_words=True,
+            break_on_hyphens=False,
+        ) or [normalized]
+
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = self._truncate_label(lines[-1], max_len=max(6, width))
+
+        return lines
+
+    def _draw_adapter_side_panel(
+        self,
+        ax,
+        x: float,
+        y: float,
+        width: float,
+        panel_data: Dict[str, Any],
+    ):
+        """Draw adapter details panel in side whitespace region."""
+        rows: List[Tuple[str, str]] = panel_data.get('rows', [])
+        title = str(panel_data.get('title', 'Adapter'))
+        subtitle = str(panel_data.get('subtitle', ''))
+        subtitle_label = str(panel_data.get('subtitle_label', 'System'))
+
+        title_h = 18.0
+        subtitle_h = 13.0
+        row_line_h = 8.5
+        row_padding = 3.6
+
+        y_limits = ax.get_ylim()
+        axis_top = min(y_limits)
+        axis_bottom = max(y_limits)
+
+        content_x = x + 4
+        content_width_chars = max(14, int((width - 12.0) / 4.9))
+        approx_label_chars = max(10, content_width_chars)
+        approx_value_chars = max(10, content_width_chars - 2)
+
+        prepared_rows: List[Dict[str, Any]] = []
+        for label, value in rows:
+            label_lines = self._wrap_panel_text(str(label), width=approx_label_chars, max_lines=3)
+            value_lines = self._wrap_panel_text(str(value), width=approx_value_chars, max_lines=3)
+            line_count = len(label_lines) + len(value_lines)
+            prepared_rows.append(
+                {
+                    'label_lines': label_lines,
+                    'value_lines': value_lines,
+                    'line_count': line_count,
+                }
+            )
+
+        body_h = sum((row['line_count'] * row_line_h) + row_padding for row in prepared_rows)
+        panel_h = max(154.0, title_h + subtitle_h + 10.0 + body_h + 7.0)
+
+        y = min(max(y, axis_top + 4.0), axis_bottom - panel_h - 4.0)
+
+        panel = FancyBboxPatch(
+            (x, y), width, panel_h,
+            boxstyle='round,pad=0.02,rounding_size=4',
+            facecolor='#FFFFFF', edgecolor='#8C9FB5', linewidth=1.1, zorder=9
+        )
+        ax.add_patch(panel)
+
+        header = Rectangle(
+            (x, y), width, title_h,
+            facecolor='#E8F2FC', edgecolor='#8C9FB5', linewidth=0.8, zorder=10
+        )
+        ax.add_patch(header)
+
+        title_text = ax.text(
+            x + 4,
+            y + (title_h / 2),
+            self._truncate_label(title, max_len=42),
+            ha='left',
+            va='center',
+            fontsize=8.5,
+            fontweight='bold',
+            color='#2A4A70',
+            zorder=11,
+        )
+        title_text.set_clip_path(panel)
+
+        subtitle_lines = self._wrap_panel_text(
+            f"{subtitle_label}: {subtitle}",
+            width=max(18, int((width - 10.0) / 4.2)),
+            max_lines=2,
+        )
+        subtitle_text = ax.text(
+            x + 4,
+            y + title_h + 2.6,
+            "\n".join(subtitle_lines),
+            ha='left',
+            va='top',
+            fontsize=7.2,
+            color='#3F4E5D',
+            linespacing=1.1,
+            zorder=11,
+        )
+        subtitle_text.set_clip_path(panel)
+
+        row_cursor_y = y + title_h + subtitle_h + 5.0
+        for idx, row in enumerate(prepared_rows):
+            if idx > 0:
+                sep_y = row_cursor_y - 2.2
+                ax.plot([x + 3.0, x + width - 3.0], [sep_y, sep_y], color='#EAF0F6', linewidth=0.6, zorder=10)
+
+            label_text = ax.text(
+                content_x,
+                row_cursor_y,
+                "\n".join(row['label_lines']),
+                ha='left',
+                va='top',
+                fontsize=6.8,
+                fontweight='bold',
+                color='#334455',
+                linespacing=1.1,
+                clip_on=True,
+                zorder=11,
+            )
+
+            value_start_y = row_cursor_y + (len(row['label_lines']) * row_line_h)
+            value_text = ax.text(
+                content_x + 8.0,
+                value_start_y,
+                "\n".join(row['value_lines']),
+                ha='left',
+                va='top',
+                fontsize=6.8,
+                color='#334455',
+                linespacing=1.1,
+                clip_on=True,
+                zorder=11,
+            )
+            label_text.set_clip_path(panel)
+            value_text.set_clip_path(panel)
+
+            row_cursor_y += (row['line_count'] * row_line_h) + row_padding
 
     @staticmethod
     def _to_float(value: Any) -> Optional[float]:
@@ -374,14 +837,23 @@ class BPMNDiagramGenerator:
             return
         xs = [pt[0] for pt in points]
         ys = [pt[1] for pt in points]
-        ax.plot(xs, ys, color=color, linewidth=1.6, linestyle='-', zorder=3)
+        ax.plot(
+            xs,
+            ys,
+            color=color,
+            linewidth=1.05,
+            linestyle='-',
+            solid_capstyle='round',
+            solid_joinstyle='round',
+            zorder=3,
+        )
 
         arrow = FancyArrowPatch(
             points[-2],
             points[-1],
             arrowstyle='-|>',
-            mutation_scale=13,
-            linewidth=1.6,
+            mutation_scale=8.8,
+            linewidth=1.05,
             color=color,
             zorder=5,
         )
@@ -393,11 +865,20 @@ class BPMNDiagramGenerator:
             return
         xs = [pt[0] for pt in points]
         ys = [pt[1] for pt in points]
-        ax.plot(xs, ys, color=color, linewidth=1.35, linestyle=(0, (6, 4)), zorder=3)
+        ax.plot(
+            xs,
+            ys,
+            color=color,
+            linewidth=0.95,
+            linestyle=(0, (4.2, 3.6)),
+            solid_capstyle='round',
+            zorder=3,
+        )
 
-        start_circle = Circle(points[0], radius=3.2, facecolor=self.WHITE, edgecolor=color, linewidth=1.1, zorder=5)
+        start_circle = Circle(points[0], radius=2.4, facecolor=self.WHITE, edgecolor=color, linewidth=0.9, zorder=5)
         ax.add_patch(start_circle)
-        self._draw_open_arrow_head(ax, points[-2], points[-1], color=color, size=8.5, width=1.2)
+        self._draw_message_envelope(ax, points[0][0] + 4.6, points[0][1] - 3.0, color=color)
+        self._draw_open_arrow_head(ax, points[-2], points[-1], color=color, size=6.7, width=0.95)
 
     @staticmethod
     def _point_inside_bounds(point: Tuple[float, float], bounds: Dict[str, float]) -> bool:
@@ -451,6 +932,7 @@ class BPMNDiagramGenerator:
         """Generate BPMN-style diagram directly from BPMN-DI coordinates."""
         try:
             root = parser.get_root()
+            self._load_runtime_parameters(parser)
             element_meta = self._collect_element_metadata(root)
             participants = self._collect_participants(root)
             shapes = self._collect_bpmndi_shapes(root)
@@ -505,6 +987,111 @@ class BPMNDiagramGenerator:
                         'target_ref': flow.attrib.get('targetRef', ''),
                     }
 
+            participant_ids = [pid for pid in participants if pid in shapes]
+            participant_ids.sort(
+                key=lambda pid: shapes[pid]['w'] * shapes[pid]['h'],
+                reverse=True,
+            )
+
+            process_pool_bounds: Optional[Dict[str, float]] = None
+            process_pool_id: Optional[str] = None
+            for participant_id in participant_ids:
+                info = participants.get(participant_id, {})
+                if info.get('process_ref'):
+                    bounds = shapes[participant_id]
+                    area = bounds['w'] * bounds['h']
+                    if process_pool_bounds is None or area > (process_pool_bounds['w'] * process_pool_bounds['h']):
+                        process_pool_bounds = bounds
+                        process_pool_id = participant_id
+
+            # Move secondary JDBC process cluster left to better match the reference layout.
+            if process_pool_id:
+                secondary_process_id: Optional[str] = None
+                for participant_id in participant_ids:
+                    if participant_id == process_pool_id:
+                        continue
+
+                    info = participants.get(participant_id, {})
+                    if not info.get('process_ref'):
+                        continue
+
+                    participant_bounds = shapes.get(participant_id)
+                    if not participant_bounds:
+                        continue
+
+                    participant_name = str(info.get('name', '')).lower()
+                    contains_jdbc = 'jdbc' in participant_name
+                    if not contains_jdbc:
+                        for element_id, element_bounds in shapes.items():
+                            if element_id in participants:
+                                continue
+                            center_point = (
+                                element_bounds['x'] + (element_bounds['w'] / 2.0),
+                                element_bounds['y'] + (element_bounds['h'] / 2.0),
+                            )
+                            if not self._point_inside_bounds(center_point, participant_bounds):
+                                continue
+                            node_name = str(element_meta.get(element_id, {}).get('name', '')).lower()
+                            if 'jdbc' in node_name:
+                                contains_jdbc = True
+                                break
+
+                    if contains_jdbc:
+                        secondary_process_id = participant_id
+                        break
+
+                if secondary_process_id:
+                    secondary_bounds = dict(shapes[secondary_process_id])
+                    cluster_ids: List[str] = [secondary_process_id]
+                    for element_id, element_bounds in shapes.items():
+                        if element_id == secondary_process_id:
+                            continue
+                        center_point = (
+                            element_bounds['x'] + (element_bounds['w'] / 2.0),
+                            element_bounds['y'] + (element_bounds['h'] / 2.0),
+                        )
+                        if self._point_inside_bounds(center_point, secondary_bounds):
+                            cluster_ids.append(element_id)
+
+                    shift_x = -46.0
+                    for element_id in cluster_ids:
+                        if element_id in shapes:
+                            shapes[element_id]['x'] = shapes[element_id]['x'] + shift_x
+
+                    for flow_id, points in list(edges.items()):
+                        if not points:
+                            continue
+
+                        flow_info = flow_meta.get(flow_id, {})
+                        source_id = str(flow_info.get('source_ref', ''))
+                        target_id = str(flow_info.get('target_ref', ''))
+                        source_in_cluster = source_id in cluster_ids
+                        target_in_cluster = target_id in cluster_ids
+
+                        if source_in_cluster and target_in_cluster:
+                            edges[flow_id] = [(x + shift_x, y) for x, y in points]
+                            continue
+
+                        if source_in_cluster and not target_in_cluster:
+                            edges[flow_id] = [
+                                (x + shift_x, y) if idx < (len(points) - 1) else (x, y)
+                                for idx, (x, y) in enumerate(points)
+                            ]
+                            continue
+
+                        if target_in_cluster and not source_in_cluster:
+                            edges[flow_id] = [
+                                (x, y) if idx == 0 else (x + shift_x, y)
+                                for idx, (x, y) in enumerate(points)
+                            ]
+                            continue
+
+                        if any(self._point_inside_bounds(point, secondary_bounds) for point in points):
+                            edges[flow_id] = [
+                                (x + shift_x, y) if self._point_inside_bounds((x, y), secondary_bounds) else (x, y)
+                                for x, y in points
+                            ]
+
             all_x: List[float] = []
             all_y: List[float] = []
             for bounds in shapes.values():
@@ -530,18 +1117,16 @@ class BPMNDiagramGenerator:
             ax.set_facecolor(self.WHITE)
             fig.patch.set_facecolor(self.WHITE)
 
+            left_panel_gutter = max(220.0, min(360.0, diagram_w * 0.24))
+            right_panel_gutter = max(220.0, min(380.0, diagram_w * 0.24))
             pad = max(20.0, min(32.0, max(diagram_w, diagram_h) * 0.03))
-            ax.set_xlim(min_x - pad, max_x + pad)
+            canvas_left = min_x - pad - left_panel_gutter
+            canvas_right = max_x + pad + right_panel_gutter
+            ax.set_xlim(canvas_left, canvas_right)
             ax.set_ylim(max_y + pad, min_y - pad)  # inverted y-axis to match BPMN canvas
             ax.axis('off')
 
             # Draw pools/participants first.
-            participant_ids = [pid for pid in participants if pid in shapes]
-            participant_ids.sort(
-                key=lambda pid: shapes[pid]['w'] * shapes[pid]['h'],
-                reverse=True,
-            )
-
             for participant_id in participant_ids:
                 info = participants.get(participant_id, {})
                 bounds = shapes[participant_id]
@@ -552,14 +1137,14 @@ class BPMNDiagramGenerator:
                 if is_process_pool:
                     pool = Rectangle(
                         (x, y), w, h,
-                        facecolor='#ECECEC', edgecolor='#6F6F6F', linewidth=1.3, zorder=1
+                        facecolor=self.SAP_POOL_BG, edgecolor=self.SAP_POOL_EDGE, linewidth=0.92, zorder=1
                     )
                     ax.add_patch(pool)
 
                     lane_w = max(22.0, min(34.0, w * 0.05))
                     lane_label = Rectangle(
                         (x, y), lane_w, h,
-                        facecolor='#E3E3E3', edgecolor='#6F6F6F', linewidth=1.1, zorder=2
+                        facecolor=self.SAP_LANE_BG, edgecolor=self.SAP_POOL_EDGE, linewidth=0.88, zorder=2
                     )
                     ax.add_patch(lane_label)
 
@@ -570,14 +1155,14 @@ class BPMNDiagramGenerator:
                         rotation=90,
                         ha='center',
                         va='center',
-                        fontsize=8,
-                        color='#3D3D3D',
+                        fontsize=7.4,
+                        color='#4D5A66',
                         zorder=3,
                     )
                 else:
                     ext_box = Rectangle(
                         (x, y), w, h,
-                        facecolor='#F6F6F6', edgecolor='#6F6F6F', linewidth=1.1, zorder=2
+                        facecolor='#FFFFFF', edgecolor='#C5CED8', linewidth=0.85, zorder=2
                     )
                     ax.add_patch(ext_box)
                     ax.text(
@@ -586,8 +1171,8 @@ class BPMNDiagramGenerator:
                         self._wrap_label(name, width=14, max_lines=3),
                         ha='center',
                         va='center',
-                        fontsize=8,
-                        color='#2F2F2F',
+                        fontsize=7.2,
+                        color='#4C5968',
                         zorder=3,
                     )
 
@@ -604,20 +1189,26 @@ class BPMNDiagramGenerator:
 
                 if 'event' in element_type:
                     radius = min(w, h) * 0.46
-                    lw = 2.2 if 'endevent' in element_type else 1.6
+                    lw = 1.6 if 'endevent' in element_type else 1.1
                     event = Circle(
                         (cx, cy), radius,
-                        facecolor='#FFFFFF', edgecolor='#2F343B', linewidth=lw, zorder=6
+                        facecolor='#FFFFFF', edgecolor='#5D7F9F', linewidth=lw, zorder=6
                     )
                     ax.add_patch(event)
+                    if 'endevent' in element_type:
+                        end_inner = Circle((cx, cy), radius * 0.74, facecolor='none', edgecolor='#5D7F9F', linewidth=0.9, zorder=6)
+                        ax.add_patch(end_inner)
+                    elif 'startevent' in element_type:
+                        start_inner = Circle((cx, cy), radius * 0.18, facecolor='#5D7F9F', edgecolor='none', zorder=7)
+                        ax.add_patch(start_inner)
                     ax.text(
                         cx,
                         y + h + 10,
                         self._wrap_label(label, width=12, max_lines=2),
                         ha='center',
                         va='top',
-                        fontsize=7.8,
-                        color='#2F343B',
+                        fontsize=7.1,
+                        color='#49657F',
                         zorder=7,
                     )
                     continue
@@ -626,17 +1217,18 @@ class BPMNDiagramGenerator:
                     diamond = patches.Polygon(
                         [(cx, y), (x + w, cy), (cx, y + h), (x, cy)],
                         closed=True,
-                        facecolor='#FFFFFF', edgecolor='#2F343B', linewidth=1.6, zorder=5
+                        facecolor='#FFFFFF', edgecolor='#6A8CAF', linewidth=1.0, zorder=5
                     )
                     ax.add_patch(diamond)
+                    self._draw_gateway_marker(ax, cx, cy, element_type)
                     ax.text(
                         cx,
                         y + h + 10,
                         self._truncate_label(label, 22),
-                        fontsize=7.8,
+                        fontsize=6.9,
                         ha='center',
                         va='top',
-                        color='#2F343B',
+                        color='#4A6781',
                         zorder=7,
                     )
                     continue
@@ -644,8 +1236,8 @@ class BPMNDiagramGenerator:
                 if 'subprocess' in element_type:
                     subproc = FancyBboxPatch(
                         (x, y), w, h,
-                        boxstyle='round,pad=0.01,rounding_size=8',
-                        facecolor='#EFEFEF', edgecolor='#6D7177', linewidth=1.2, zorder=4
+                        boxstyle='round,pad=0.01,rounding_size=6',
+                        facecolor='#FAFCFE', edgecolor='#B4C3D1', linewidth=0.95, zorder=4
                     )
                     ax.add_patch(subproc)
                     label_y = y + min(18.0, max(12.0, h * 0.18))
@@ -655,25 +1247,22 @@ class BPMNDiagramGenerator:
                         self._wrap_label(label, width=max(10, int(w / 7)), max_lines=2),
                         ha='center',
                         va='top',
-                        fontsize=8,
-                        color='#2F343B',
+                        fontsize=7.1,
+                        color='#3B556D',
                         zorder=6,
                     )
                     self._draw_collapsed_marker(ax, cx, y + h - 5, w)
                     continue
 
                 # Default task/callActivity/serviceTask style.
-                line_w = 2.0 if 'callactivity' in element_type else 1.7
+                line_w = 1.25 if 'callactivity' in element_type else 1.0
                 task = FancyBboxPatch(
                     (x, y), w, h,
-                    boxstyle='round,pad=0.01,rounding_size=10',
-                    facecolor='#FFFFFF', edgecolor='#2F343B', linewidth=line_w, zorder=5
+                    boxstyle='round,pad=0.01,rounding_size=4.6',
+                    facecolor=self.SAP_TASK_FILL, edgecolor=self.SAP_TASK_EDGE, linewidth=line_w, zorder=5
                 )
                 ax.add_patch(task)
-
-                if 'servicetask' in element_type:
-                    ax.add_patch(Circle((x + 8.5, y + 8.5), 3.2, facecolor='#F2F2F2',
-                                        edgecolor='#6A6A6A', linewidth=0.8, zorder=6))
+                self._draw_task_corner_icon(ax, x, y)
 
                 ax.text(
                     cx,
@@ -681,10 +1270,11 @@ class BPMNDiagramGenerator:
                     self._wrap_label(label, width=max(10, int(w / 7)), max_lines=2),
                     ha='center',
                     va='center',
-                    fontsize=8.2,
-                    color='#2F343B',
+                    fontsize=7.1,
+                    color=self.SAP_TEXT,
                     zorder=6,
                 )
+                self._draw_task_activity_marker(ax, cx, y + h - 3.4, w)
 
                 if 'callactivity' in element_type:
                     self._draw_collapsed_marker(ax, cx, y + h - 5, w)
@@ -693,7 +1283,7 @@ class BPMNDiagramGenerator:
             for flow_id, points in edges.items():
                 info = flow_meta.get(flow_id, {'type': 'sequence', 'name': ''})
                 is_message = info.get('type') == 'message'
-                color = '#7A7A7A' if is_message else '#2F343B'
+                color = self.SAP_MSG_FLOW if is_message else self.SAP_SEQ_FLOW
 
                 source_bounds = shapes.get(str(info.get('source_ref', '')))
                 target_bounds = shapes.get(str(info.get('target_ref', '')))
@@ -715,12 +1305,69 @@ class BPMNDiagramGenerator:
                         mid_x,
                         mid_y - 10,
                         self._truncate_label(flow_name, max_len=34),
-                        fontsize=7.6,
-                        color='#4A4A4A',
+                        fontsize=6.8,
+                        color='#5A738B',
                         ha='center',
                         va='center',
-                        bbox=dict(facecolor='#FFFFFF', edgecolor='none', alpha=0.8, pad=0.6),
                         zorder=8,
+                    )
+
+            # Add sender/receiver adapter detail panels in side whitespace areas.
+            if process_pool_bounds:
+                try:
+                    sender_props = parser.extract_sender_properties()
+                    receiver_props = parser.extract_receiver_properties()
+                except Exception as panel_exc:
+                    logger.debug(f"Unable to extract sender/receiver properties for side panels: {panel_exc}")
+                    sender_props = []
+                    receiver_props = []
+
+                sender_panel = self._build_adapter_panel(sender_props, 'Sender')
+                receiver_panel = self._build_adapter_panel(receiver_props, 'Receiver')
+
+                lower_threshold_y = process_pool_bounds['y'] + (process_pool_bounds['h'] * 0.55)
+                process_bottom = process_pool_bounds['y'] + process_pool_bounds['h']
+
+                side_anchor_bounds: List[Dict[str, float]] = []
+                for participant_id in participant_ids:
+                    if participant_id == process_pool_id:
+                        continue
+                    bounds = shapes.get(participant_id)
+                    if not bounds:
+                        continue
+                    if bounds['y'] >= lower_threshold_y or (bounds['y'] + bounds['h']) >= process_bottom:
+                        side_anchor_bounds.append(bounds)
+
+                if side_anchor_bounds:
+                    left_anchor = min(bounds['x'] for bounds in side_anchor_bounds)
+                    right_anchor = max(bounds['x'] + bounds['w'] for bounds in side_anchor_bounds)
+                    panel_y = min(bounds['y'] for bounds in side_anchor_bounds) + 4.0
+                else:
+                    left_anchor = process_pool_bounds['x']
+                    right_anchor = process_pool_bounds['x'] + process_pool_bounds['w']
+                    panel_y = process_pool_bounds['y'] + (process_pool_bounds['h'] * 0.56)
+
+                left_space = left_anchor - canvas_left
+                right_space = canvas_right - right_anchor
+
+                if left_space >= 180:
+                    left_width = min(350.0, max(240.0, left_space - 14.0))
+                    self._draw_adapter_side_panel(
+                        ax,
+                        x=canvas_left + 12.0,
+                        y=panel_y,
+                        width=left_width,
+                        panel_data=sender_panel,
+                    )
+
+                if right_space >= 180:
+                    right_width = min(420.0, max(280.0, right_space - 16.0))
+                    self._draw_adapter_side_panel(
+                        ax,
+                        x=canvas_right - right_width - 12.0,
+                        y=panel_y,
+                        width=right_width,
+                        panel_data=receiver_panel,
                     )
 
             plt.tight_layout()
@@ -938,6 +1585,159 @@ def generate_diagram_bytes(parser, diagram_type: str = "integration_flow") -> Op
             
     except Exception as e:
         logger.error(f"Error generating {diagram_type} diagram: {e}")
+        return None
+
+
+def extract_exception_subdiagram_bytes(parser, integration_diagram_bytes: bytes) -> Optional[bytes]:
+    """
+    Copy the exception subprocess area from an existing integration diagram image.
+
+    This keeps the original integration image unchanged and returns a separate
+    cropped PNG for re-use in other document sections.
+    """
+    if not integration_diagram_bytes:
+        return None
+
+    try:
+        generator = BPMNDiagramGenerator(parser.iflow_name)
+        root = parser.get_root()
+
+        element_meta = generator._collect_element_metadata(root)
+        participants = generator._collect_participants(root)
+        shapes = generator._collect_bpmndi_shapes(root)
+        edges = generator._collect_bpmndi_edges(root)
+
+        if not shapes:
+            return None
+
+        candidate: Optional[Dict[str, Any]] = None
+        for element_id, bounds in shapes.items():
+            if element_id in participants:
+                continue
+
+            meta = element_meta.get(element_id, {})
+            element_type = str(meta.get('type', '')).lower()
+            if 'subprocess' not in element_type:
+                continue
+
+            name = str(meta.get('name', '')).strip()
+            priority = 2 if re.search(r'exception|error', name, re.IGNORECASE) else 1
+            area = float(bounds.get('w', 0.0)) * float(bounds.get('h', 0.0))
+            sort_key = (priority, area)
+
+            if candidate is None or sort_key > candidate['sort_key']:
+                candidate = {'bounds': bounds, 'sort_key': sort_key}
+
+        if candidate is None:
+            return None
+
+        sub_bounds = candidate['bounds']
+
+        all_x: List[float] = []
+        all_y: List[float] = []
+        for bounds in shapes.values():
+            all_x.extend([bounds['x'], bounds['x'] + bounds['w']])
+            all_y.extend([bounds['y'], bounds['y'] + bounds['h']])
+        for points in edges.values():
+            all_x.extend([pt[0] for pt in points])
+            all_y.extend([pt[1] for pt in points])
+
+        if not all_x or not all_y:
+            return None
+
+        min_x, max_x = min(all_x), max(all_x)
+        min_y, max_y = min(all_y), max(all_y)
+        diagram_w = max(max_x - min_x, 1.0)
+        diagram_h = max(max_y - min_y, 1.0)
+
+        left_panel_gutter = max(220.0, min(360.0, diagram_w * 0.24))
+        right_panel_gutter = max(220.0, min(380.0, diagram_w * 0.24))
+        pad = max(20.0, min(32.0, max(diagram_w, diagram_h) * 0.03))
+
+        canvas_left = min_x - pad - left_panel_gutter
+        canvas_right = max_x + pad + right_panel_gutter
+        canvas_top = min_y - pad
+        canvas_bottom = max_y + pad
+
+        margin_x = max(24.0, sub_bounds['w'] * 0.11)
+        margin_y = max(22.0, sub_bounds['h'] * 0.18)
+
+        x_left = max(canvas_left, sub_bounds['x'] - margin_x)
+        x_right = min(canvas_right, sub_bounds['x'] + sub_bounds['w'] + margin_x)
+        y_top = max(canvas_top, sub_bounds['y'] - margin_y)
+        y_bottom = min(canvas_bottom, sub_bounds['y'] + sub_bounds['h'] + margin_y)
+
+        if x_right <= x_left or y_bottom <= y_top:
+            return None
+
+        image = plt.imread(io.BytesIO(integration_diagram_bytes), format='png')
+        if image is None or len(getattr(image, 'shape', ())) < 2:
+            return None
+
+        img_h = int(image.shape[0])
+        img_w = int(image.shape[1])
+        if img_h <= 0 or img_w <= 0:
+            return None
+
+        span_x = max(canvas_right - canvas_left, 1.0)
+        span_y = max(canvas_bottom - canvas_top, 1.0)
+
+        px_left = int((x_left - canvas_left) / span_x * img_w)
+        px_right = int((x_right - canvas_left) / span_x * img_w)
+
+        py_top_a = int((y_top - canvas_top) / span_y * img_h)
+        py_bottom_a = int((y_bottom - canvas_top) / span_y * img_h)
+
+        py_top_b = int((canvas_bottom - y_bottom) / span_y * img_h)
+        py_bottom_b = int((canvas_bottom - y_top) / span_y * img_h)
+
+        def _clamp(v: int, low: int, high: int) -> int:
+            return max(low, min(v, high))
+
+        px_left = _clamp(px_left, 0, img_w - 1)
+        px_right = _clamp(px_right, 1, img_w)
+        if px_right <= px_left:
+            return None
+
+        def _crop(y0: int, y1: int):
+            y0 = _clamp(y0, 0, img_h - 1)
+            y1 = _clamp(y1, 1, img_h)
+            if y1 <= y0:
+                return None
+            return image[y0:y1, px_left:px_right]
+
+        crop_a = _crop(py_top_a, py_bottom_a)
+        crop_b = _crop(py_top_b, py_bottom_b)
+
+        def _coverage(crop) -> float:
+            if crop is None or crop.size == 0:
+                return 0.0
+            if len(crop.shape) == 2:
+                if str(crop.dtype).startswith('uint'):
+                    return float((crop < 247).mean())
+                return float((crop < 0.97).mean())
+
+            rgb = crop[..., :3]
+            if str(rgb.dtype).startswith('uint'):
+                mask = (rgb < 247).any(axis=2)
+            else:
+                mask = (rgb < 0.97).any(axis=2)
+            return float(mask.mean())
+
+        selected = crop_a if _coverage(crop_a) >= _coverage(crop_b) else crop_b
+        if selected is None:
+            return None
+
+        if int(selected.shape[0]) < 20 or int(selected.shape[1]) < 20:
+            return None
+
+        buf = io.BytesIO()
+        plt.imsave(buf, selected, format='png')
+        buf.seek(0)
+        return buf.getvalue()
+
+    except Exception as exc:
+        logger.debug(f"Failed to extract exception subprocess crop: {exc}")
         return None
 
 

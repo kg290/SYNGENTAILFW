@@ -25,13 +25,21 @@ from docx.shared import Inches, Pt, RGBColor, Cm, Twips
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ROW_HEIGHT_RULE
 from docx.enum.style import WD_STYLE_TYPE
-from docx.oxml.ns import qn
+from docx.oxml.ns import qn, nsmap
 from docx.oxml import OxmlElement
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config.settings import OUTPUT_DIR, DOC_AUTHOR, DOC_VERSION, ENABLE_BATCH_MODE
+from config.settings import (
+    OUTPUT_DIR,
+    DOC_AUTHOR,
+    DOC_VERSION,
+    ENABLE_BATCH_MODE,
+    TECH_SPEC_SCOPE_MODE,
+)
 
 logger = logging.getLogger(__name__)
+
+W15_WORDML_NS = "http://schemas.microsoft.com/office/word/2012/wordml"
 
 
 class DocumentBuilderError(Exception):
@@ -55,9 +63,16 @@ class EnterpriseDocumentBuilder:
         self.output_dir = output_dir or OUTPUT_DIR
         self.output_dir.mkdir(exist_ok=True)
         self.doc = Document()
+        self._bookmark_id_counter = 1
+        self._ensure_wordml_namespaces()
         self._setup_page()
+        self._set_modern_compatibility_mode()
         self._setup_header_footer()
         # Keep field updates manual to avoid Word's update-fields prompt on open.
+
+    def _ensure_wordml_namespaces(self):
+        """Ensure helper namespace map supports w15 element creation."""
+        nsmap.setdefault('w15', W15_WORDML_NS)
     
     def _setup_page(self):
         """Configure page layout."""
@@ -68,6 +83,24 @@ class EnterpriseDocumentBuilder:
         section.bottom_margin = Inches(1)
         section.left_margin = Inches(1.25)
         section.right_margin = Inches(1)
+
+    def _set_modern_compatibility_mode(self):
+        """Set Word compatibility mode to modern format so collapse behavior is honored."""
+        settings = self.doc.settings.element
+        compat = settings.find(qn('w:compat'))
+        if compat is None:
+            compat = OxmlElement('w:compat')
+            settings.append(compat)
+
+        for child in list(compat):
+            if child.tag == qn('w:compatSetting') and child.get(qn('w:name')) == 'compatibilityMode':
+                compat.remove(child)
+
+        compat_setting = OxmlElement('w:compatSetting')
+        compat_setting.set(qn('w:name'), 'compatibilityMode')
+        compat_setting.set(qn('w:uri'), 'http://schemas.microsoft.com/office/word')
+        compat_setting.set(qn('w:val'), '16')
+        compat.append(compat_setting)
 
     def _append_field(self, paragraph, instruction: str, default_text: str = ""):
         """Append a Word field code to a paragraph."""
@@ -272,9 +305,41 @@ class EnterpriseDocumentBuilder:
         
         self.doc.add_page_break()
     
-    def add_heading(self, text: str, level: int = 1):
+    def _set_paragraph_outline_level(self, paragraph, level: int):
+        """Ensure heading outline level is explicit so Word can collapse the section."""
+        p_pr = paragraph._p.get_or_add_pPr()
+        outline = p_pr.find(qn('w:outlineLvl'))
+        if outline is None:
+            outline = OxmlElement('w:outlineLvl')
+            p_pr.append(outline)
+        outline.set(qn('w:val'), str(max(0, min(8, level - 1))))
+
+    def _set_paragraph_collapsed(self, paragraph, collapsed: bool = True):
+        """Mark a heading paragraph as collapsed by default across Word versions."""
+        p_pr = paragraph._p.get_or_add_pPr()
+
+        for tag in ('w:collapsed', 'w14:collapsed', 'w15:collapsed'):
+            node = p_pr.find(qn(tag))
+            if node is not None:
+                p_pr.remove(node)
+
+        if not collapsed:
+            return
+
+        # Legacy marker used by older Word/OOXML consumers.
+        legacy = OxmlElement('w:collapsed')
+        legacy.set(qn('w:val'), '1')
+        p_pr.append(legacy)
+
+        # Default-collapsed marker used by modern Word (Office 2013+).
+        modern = OxmlElement('w15:collapsed')
+        p_pr.append(modern)
+
+    def add_heading(self, text: str, level: int = 1, collapsed: bool = False):
         """Add heading with styling."""
-        h = self.doc.add_heading(text, level=min(level, 4))
+        normalized_level = min(level, 4)
+        h = self.doc.add_heading(text, level=normalized_level)
+        self._set_paragraph_outline_level(h, normalized_level)
         h.paragraph_format.keep_with_next = True
         h.paragraph_format.keep_together = True
         for run in h.runs:
@@ -288,6 +353,10 @@ class EnterpriseDocumentBuilder:
             else:
                 run.font.size = Pt(12)
                 run.font.color.rgb = self.DARK_TEXT
+
+        if collapsed:
+            self._set_paragraph_collapsed(h, True)
+
         return h
     
     def add_paragraph(self, text: str, bold: bool = False, italic: bool = False):
@@ -299,6 +368,70 @@ class EnterpriseDocumentBuilder:
         run.font.name = 'Calibri'
         run.font.size = Pt(11)
         run.font.color.rgb = self.DARK_TEXT
+        p.paragraph_format.space_after = Pt(8)
+        p.paragraph_format.line_spacing = 1.15
+        return p
+
+    def _next_bookmark_id(self) -> int:
+        """Return the next unique Word bookmark id."""
+        next_id = self._bookmark_id_counter
+        self._bookmark_id_counter += 1
+        return next_id
+
+    def add_bookmark(self, paragraph, bookmark_name: str):
+        """Attach a Word bookmark to the provided paragraph."""
+        name = str(bookmark_name or "").strip()
+        if not name:
+            name = f"bookmark_{self._next_bookmark_id()}"
+
+        bookmark_id = str(self._next_bookmark_id())
+
+        bookmark_start = OxmlElement('w:bookmarkStart')
+        bookmark_start.set(qn('w:id'), bookmark_id)
+        bookmark_start.set(qn('w:name'), name)
+
+        bookmark_end = OxmlElement('w:bookmarkEnd')
+        bookmark_end.set(qn('w:id'), bookmark_id)
+
+        paragraph._p.insert(0, bookmark_start)
+        paragraph._p.append(bookmark_end)
+        return name
+
+    def add_internal_hyperlink(self, paragraph, text: str, anchor: str):
+        """Add an internal clickable hyperlink to a bookmark anchor."""
+        hyperlink = OxmlElement('w:hyperlink')
+        hyperlink.set(qn('w:anchor'), str(anchor))
+        hyperlink.set(qn('w:history'), '1')
+
+        run = OxmlElement('w:r')
+        run_pr = OxmlElement('w:rPr')
+
+        run_style = OxmlElement('w:rStyle')
+        run_style.set(qn('w:val'), 'Hyperlink')
+        run_pr.append(run_style)
+
+        color = OxmlElement('w:color')
+        color.set(qn('w:val'), '0563C1')
+        run_pr.append(color)
+
+        underline = OxmlElement('w:u')
+        underline.set(qn('w:val'), 'single')
+        run_pr.append(underline)
+
+        run.append(run_pr)
+
+        text_node = OxmlElement('w:t')
+        text_node.text = self._strip_markdown_inline(text)
+        run.append(text_node)
+
+        hyperlink.append(run)
+        paragraph._p.append(hyperlink)
+        return paragraph
+
+    def add_internal_link_paragraph(self, text: str, anchor: str):
+        """Add a paragraph that links to another place in the same document."""
+        p = self.doc.add_paragraph()
+        self.add_internal_hyperlink(p, text, anchor)
         p.paragraph_format.space_after = Pt(8)
         p.paragraph_format.line_spacing = 1.15
         return p
@@ -421,14 +554,14 @@ class EnterpriseDocumentBuilder:
         
         self.doc.add_paragraph()
     
-    def add_code_block(self, code: str, language: str = "", max_lines: int = 40):
+    def add_code_block(self, code: str, language: str = "", max_lines: Optional[int] = 40):
         """Add code block."""
         if language:
             p = self.add_paragraph(f"[{language}]", italic=True)
             p.paragraph_format.space_after = Pt(2)
         
         lines = code.strip().split('\n')
-        if len(lines) > max_lines:
+        if max_lines is not None and max_lines > 0 and len(lines) > max_lines:
             code = '\n'.join(lines[:max_lines]) + f"\n\n... [{len(lines) - max_lines} more lines]"
         
         p = self.doc.add_paragraph()
@@ -482,15 +615,27 @@ def build_specification_document(
     schemas: Optional[List[Dict[str, Any]]] = None,
     parameters: Optional[Dict[str, str]] = None,
     parameter_definitions: Optional[Dict[str, str]] = None,
+    all_files: Optional[List[Dict[str, Any]]] = None,
+    file_type_summary: Optional[Dict[str, int]] = None,
+    text_artifacts: Optional[List[Dict[str, Any]]] = None,
+    artifact_analysis_context: str = "",
     output_dir: Optional[Path] = None,
     include_diagrams: bool = True,
     functional_spec_context: str = "",
+    functional_spec_analysis: Optional[Dict[str, Any]] = None,
+    scope_mode: str = TECH_SPEC_SCOPE_MODE,
 ) -> Path:
     """Build a detailed enterprise specification document."""
 
     schemas = schemas or []
     parameters = parameters or {}
     parameter_definitions = parameter_definitions or {}
+    all_files = all_files or []
+    file_type_summary = file_type_summary or {}
+    text_artifacts = text_artifacts or []
+    functional_spec_analysis = functional_spec_analysis or {}
+    scope_mode = str(scope_mode or TECH_SPEC_SCOPE_MODE).strip().lower()
+    is_extended_scope = scope_mode == "extended"
 
     iflow_name = parser.iflow_name
     all_processes = parser.get_integration_processes()
@@ -512,6 +657,7 @@ def build_specification_document(
     print(f"  Processes: {len(all_processes)}")
     print(f"  Scripts: {len(groovy_scripts)}")
     print(f"  Schemas: {len(schemas)}")
+    print(f"  Total Files Analyzed: {len(all_files)}")
     print(f"  Diagrams: {'Enabled' if include_diagrams else 'Disabled'}")
     print("=" * 70)
 
@@ -520,23 +666,38 @@ def build_specification_document(
     # ========================================================================
     diagram_bytes: Dict[str, bytes] = {}
     if include_diagrams:
-        print("\n🎨 Generating diagrams...")
+        print("\n[INFO] Generating diagrams...")
         try:
-            from src.diagram_generator import generate_diagram_bytes
+            from src.diagram_generator import generate_diagram_bytes, extract_exception_subdiagram_bytes
 
             for dtype in ['integration_flow']:
-                print(f"   • {dtype.replace('_', ' ').title()}...", end=" ")
+                print(f"   - {dtype.replace('_', ' ').title()}...", end=" ")
                 try:
                     img = generate_diagram_bytes(parser, dtype)
                     if img:
                         diagram_bytes[dtype] = img
-                        print("✅")
+                        print("[OK]")
                     else:
-                        print("⚠️")
+                        print("[WARN]")
                 except Exception as e:
-                    print(f"❌ {e}")
+                    print(f"[ERROR] {e}")
+
+            if 'integration_flow' in diagram_bytes:
+                print("   - Exception Subprocess Snapshot...", end=" ")
+                try:
+                    exception_img = extract_exception_subdiagram_bytes(
+                        parser,
+                        diagram_bytes['integration_flow'],
+                    )
+                    if exception_img:
+                        diagram_bytes['exception_subprocess'] = exception_img
+                        print("[OK]")
+                    else:
+                        print("[SKIP]")
+                except Exception as e:
+                    print(f"[WARN] {e}")
         except ImportError as e:
-            print(f"   ⚠️ Diagrams not available: {e}")
+            print(f"   [WARN] Diagrams not available: {e}")
 
     # ========================================================================
     # BATCH AI GENERATION
@@ -544,7 +705,7 @@ def build_specification_document(
     batch: Dict[str, Any] = {}
 
     if ENABLE_BATCH_MODE and hasattr(ai_generator, 'generate_all_sections_batch'):
-        print("\n🚀 Generating AI content...")
+        print("\n[INFO] Generating AI content...")
 
         combined_xml = "\n".join([
             parser.extract_collaboration_xml(),
@@ -562,13 +723,15 @@ def build_specification_document(
             xml_content=combined_xml,
             groovy_scripts=groovy_scripts,
             functional_spec_context=functional_spec_context,
+            functional_spec_analysis=functional_spec_analysis,
+            artifact_analysis_context=artifact_analysis_context,
         )
 
         if isinstance(generated, dict):
             batch = generated
-            print("   ✅ AI content generated!")
+            print("   [OK] AI content generated")
         else:
-            print("   ⚠️ Using fallback mode")
+            print("   [WARN] Using fallback mode")
 
     def value_to_text(value: Any) -> str:
         if value is None:
@@ -605,8 +768,13 @@ def build_specification_document(
             ai_stats = raw_stats
 
     assumptions = get_dict("functional_assumptions")
+    functional_alignment = get_dict("functional_spec_alignment")
+    artifact_coverage = get_dict("artifact_coverage")
     dependencies_text = get_text("technical_dependencies")
     process_flow_data = get_dict("process_flow")
+    include_traceability_section = is_extended_scope and bool(
+        functional_spec_analysis or functional_alignment
+    )
 
     def dict_to_rows(data: Dict[str, Any]) -> List[List[str]]:
         rows: List[List[str]] = []
@@ -616,7 +784,7 @@ def build_specification_document(
                 rows.append([k.replace('_', ' ').title(), rendered])
         return rows
 
-    print("\n📄 Building document...")
+    print("\n[INFO] Building document...")
 
     # Cover + TOC
     print("   [1/10] Cover Page...")
@@ -639,6 +807,8 @@ def build_specification_document(
         "3.2 To-Be Scenario",
         "3.3 High Level Design",
     ])
+    if include_traceability_section:
+        toc_entries.insert(toc_entries.index("3. High level iFlow Design"), "2.6 Functional Specification Traceability")
     if dependencies_text:
         toc_entries.append("3.4 Technical Dependencies")
     toc_entries.extend([
@@ -667,10 +837,16 @@ def build_specification_document(
         "7.2 Schemas",
         "7.3 Runtime Parameters",
         "7.4 Parameter Definitions",
-        "7.5 Glossary",
-        "7.6 References",
-        "7.7 Generation Statistics",
     ])
+    if is_extended_scope:
+        toc_entries.extend([
+            "7.5 Glossary",
+            "7.6 References",
+            "7.7 Generation Statistics",
+            "7.8 File Type Summary",
+            "7.9 File Inventory",
+            "7.10 Artifact Evidence",
+        ])
     builder.add_toc_placeholder(toc_entries)
 
     # 1. Change History
@@ -712,17 +888,63 @@ def build_specification_document(
         builder.add_table(["Assumption", "Value"], dict_to_rows(assumptions))
 
     builder.add_heading("2.5 Integration Snapshot", 2)
+    snapshot_rows = [
+        ["Integration Processes", str(len(all_processes))],
+        ["Message Flows", str(len(message_flows))],
+        ["Sequence Flows", str(len(sequence_flows))],
+        ["Groovy Scripts", str(len(groovy_scripts))],
+        ["Schemas", str(len(schemas))],
+        ["Runtime Parameters", str(len(parameters))],
+    ]
+    if is_extended_scope:
+        snapshot_rows.append(["Total Files Analyzed", str(len(all_files))])
+
     builder.add_table(
         ["Metric", "Value"],
-        [
-            ["Integration Processes", str(len(all_processes))],
-            ["Message Flows", str(len(message_flows))],
-            ["Sequence Flows", str(len(sequence_flows))],
-            ["Groovy Scripts", str(len(groovy_scripts))],
-            ["Schemas", str(len(schemas))],
-            ["Runtime Parameters", str(len(parameters))],
-        ],
+        snapshot_rows,
     )
+
+    if include_traceability_section:
+        builder.add_heading("2.6 Functional Specification Traceability", 2)
+        if functional_spec_analysis:
+            analysis_summary_rows = dict_to_rows(
+                {
+                    "analysis_summary": functional_spec_analysis.get("analysis_summary", ""),
+                    "document_count": functional_spec_analysis.get("document_count", ""),
+                    "source_files": functional_spec_analysis.get("source_files", []),
+                    "top_terms": functional_spec_analysis.get("top_terms", []),
+                }
+            )
+            if analysis_summary_rows:
+                builder.add_table(["Aspect", "Details"], analysis_summary_rows)
+
+            fs_req = functional_spec_analysis.get("business_requirements", [])
+            if isinstance(fs_req, list) and fs_req:
+                builder.add_heading("Detected Requirement Signals", 3)
+                builder.add_bullet_list([str(item) for item in fs_req])
+
+            fs_interfaces = functional_spec_analysis.get("interface_points", [])
+            if isinstance(fs_interfaces, list) and fs_interfaces:
+                builder.add_heading("Detected Interface Signals", 3)
+                builder.add_bullet_list([str(item) for item in fs_interfaces])
+
+        if functional_alignment:
+            builder.add_heading("AI Traceability Interpretation", 3)
+            alignment_rows = dict_to_rows(
+                {
+                    "requirement_traceability": functional_alignment.get("requirement_traceability", []),
+                    "assumptions_used": functional_alignment.get("assumptions_used", []),
+                    "open_questions": functional_alignment.get("open_questions", []),
+                }
+            )
+            if alignment_rows:
+                builder.add_table(["Traceability Aspect", "Details"], alignment_rows)
+
+        if not functional_spec_analysis and not functional_alignment:
+            builder.add_paragraph(
+                "Functional specification traceability is not available because no readable functional specification evidence was loaded.",
+                italic=True,
+            )
 
     # 3. High Level iFlow Design
     print("   [5/10] High Level Design...")
@@ -888,10 +1110,10 @@ def build_specification_document(
         builder.add_paragraph(str(groovy_ai.get("overview")))
 
     if groovy_scripts:
-        for script in groovy_scripts:
-            script_name = script.get("file_name") or script.get("name") or "Script"
-            content = script.get("content", "")
-            builder.add_heading(f"Script: {script_name}", 3)
+        for idx, script in enumerate(groovy_scripts, start=1):
+            script_name = str(script.get("file_name") or script.get("name") or f"Script {idx}")
+            content = str(script.get("content", "") or "")
+            builder.add_heading(f"Script: {script_name}", 3, collapsed=True)
 
             script_meta_rows = dict_to_rows({
                 "line_count": script.get("line_count", ""),
@@ -912,8 +1134,11 @@ def build_specification_document(
                     ])
                 builder.add_table(["Function", "Parameters", "Documentation"], fn_rows)
 
-            if content:
-                builder.add_code_block(content, "Groovy", max_lines=60)
+            builder.add_heading("Code", 4, collapsed=True)
+            if content.strip():
+                builder.add_code_block(content, "Groovy", max_lines=None)
+            else:
+                builder.add_paragraph("No script content available.", italic=True)
     else:
         builder.add_paragraph("No Groovy scripts in this integration flow.", italic=True)
 
@@ -922,6 +1147,14 @@ def build_specification_document(
     error_ai = get_dict("error_handling")
     if error_ai:
         builder.add_table(["Aspect", "Details"], dict_to_rows(error_ai))
+
+    if 'exception_subprocess' in diagram_bytes:
+        builder.add_heading("Exception SubProcess Diagram", 3)
+        builder.add_image(
+            diagram_bytes['exception_subprocess'],
+            width=5.4,
+            caption="Exception SubProcess (Copied from Integration Flow Diagram)",
+        )
 
     if exception_props:
         for idx, exc in enumerate(exception_props, start=1):
@@ -992,32 +1225,95 @@ def build_specification_document(
         def_rows = [[str(k), str(v)] for k, v in parameter_definitions.items()]
         builder.add_table(["Parameter", "Definition"], def_rows)
 
-    glossary = appendix.get("glossary", []) if isinstance(appendix.get("glossary"), list) else []
-    if glossary:
-        builder.add_heading("7.5 Glossary", 2)
-        builder.add_bullet_list([str(item) for item in glossary])
+    if is_extended_scope:
+        glossary = appendix.get("glossary", []) if isinstance(appendix.get("glossary"), list) else []
+        if glossary:
+            builder.add_heading("7.5 Glossary", 2)
+            builder.add_bullet_list([str(item) for item in glossary])
 
-    references = appendix.get("references", "")
-    if references:
-        builder.add_heading("7.6 References", 2)
-        builder.add_paragraph(str(references))
+        references = appendix.get("references", "")
+        if references:
+            builder.add_heading("7.6 References", 2)
+            builder.add_paragraph(str(references))
 
-    if ai_stats:
-        builder.add_heading("7.7 Generation Statistics", 2)
-        stat_rows = [
-            ["API Calls", str(ai_stats.get("api_calls", 0))],
-            ["Batch Calls", str(ai_stats.get("batch_calls", 0))],
-            ["Cache Hits", str(ai_stats.get("cache_hits", 0))],
-            ["Cache Hit Rate", f"{ai_stats.get('cache_hit_rate', 0)}%"],
-            ["Failures", str(ai_stats.get("failures", 0))],
-        ]
-        builder.add_table(["Statistic", "Value"], stat_rows)
+        if ai_stats:
+            builder.add_heading("7.7 Generation Statistics", 2)
+            stat_rows = [
+                ["API Calls", str(ai_stats.get("api_calls", 0))],
+                ["Batch Calls", str(ai_stats.get("batch_calls", 0))],
+                ["Cache Hits", str(ai_stats.get("cache_hits", 0))],
+                ["Cache Hit Rate", f"{ai_stats.get('cache_hit_rate', 0)}%"],
+                ["Failures", str(ai_stats.get("failures", 0))],
+            ]
+            builder.add_table(["Statistic", "Value"], stat_rows)
+
+        if file_type_summary:
+            builder.add_heading("7.8 File Type Summary", 2)
+            type_rows = [[str(ext), str(count)] for ext, count in file_type_summary.items()]
+            builder.add_table(["File Type", "Count"], type_rows)
+
+        if all_files:
+            builder.add_heading("7.9 File Inventory", 2)
+            inventory_rows: List[List[str]] = []
+            max_inventory_rows = 160
+            sorted_files = sorted(
+                all_files,
+                key=lambda item: str(item.get("relative_path", "")).lower(),
+            )
+            for entry in sorted_files[:max_inventory_rows]:
+                inventory_rows.append(
+                    [
+                        str(entry.get("relative_path", "")),
+                        str(entry.get("category", "")),
+                        str(entry.get("extension", "")),
+                        str(entry.get("size_bytes", "")),
+                    ]
+                )
+
+            builder.add_table(["File", "Category", "Type", "Size (bytes)"], inventory_rows)
+            if len(sorted_files) > max_inventory_rows:
+                builder.add_paragraph(
+                    f"Inventory truncated in document view: showing {max_inventory_rows} of {len(sorted_files)} files.",
+                    italic=True,
+                )
+
+        if artifact_coverage or text_artifacts:
+            builder.add_heading("7.10 Artifact Evidence", 2)
+
+            if artifact_coverage:
+                builder.add_table(
+                    ["Artifact Coverage Aspect", "Details"],
+                    dict_to_rows(
+                        {
+                            "analyzed_file_types": artifact_coverage.get("analyzed_file_types", []),
+                            "critical_non_iflow_artifacts": artifact_coverage.get(
+                                "critical_non_iflow_artifacts", []
+                            ),
+                            "observations": artifact_coverage.get("observations", []),
+                        }
+                    ),
+                )
+
+            if text_artifacts:
+                evidence_rows: List[List[str]] = []
+                for artifact in text_artifacts[:60]:
+                    signals = artifact.get("signal_lines", [])
+                    signal_text = " | ".join([str(line) for line in signals[:2]]) if isinstance(signals, list) else ""
+                    evidence_rows.append(
+                        [
+                            str(artifact.get("relative_path", "")),
+                            str(artifact.get("category", "")),
+                            signal_text,
+                        ]
+                    )
+
+                builder.add_table(["File", "Category", "Evidence Snippets"], evidence_rows)
 
     print("   [10/10] Finalizing...")
     output_path = builder.save()
 
     print("\n" + "=" * 70)
-    print(f"  ✅ Document generated: {output_path}")
+    print(f"  [OK] Document generated: {output_path}")
     print("=" * 70)
     return output_path
 

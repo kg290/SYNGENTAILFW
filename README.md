@@ -162,7 +162,7 @@ python main.py interactive
 python main.py project.zip
 
 # Process an extracted directory
-python main.py run ./Foundation_BusinessDocumentPDF_IDT_Subscriber
+python main.py run ./integration_project
 
 # Process with positional output directory
 python main.py run project.zip ./specs
@@ -171,7 +171,7 @@ python main.py run project.zip ./specs
 python main.py run project.zip --output ./specs -v
 
 # Optional manual override for functional specification context
-python main.py run project.zip --functional-spec "./Functional Specification GSAP_eCustoms_MIC.doc"
+python main.py run project.zip --functional-spec "./Functional Specification.docx"
 
 # Validate setup before generation
 python main.py validate project.zip
@@ -214,6 +214,7 @@ Functional specification discovery behavior:
 | `ENABLE_BATCH_MODE` | No | `true` | Use batch API processing |
 | `ENABLE_STREAMING` | No | `false` | Enable streaming responses |
 | `USE_THINKING_MODEL` | No | `false` | Use Gemini thinking model |
+| `TECH_SPEC_SCOPE_MODE` | No | `strict` | `strict` keeps core technical sections, `extended` also includes traceability and inventory appendices |
 | `AI_MAX_RETRIES` | No | `3` | Max API retry attempts |
 | `AI_SENTENCE_LIMIT` | No | `5` | Sentences per AI summary |
 | `FUNCTIONAL_SPEC_MAX_CHARS` | No | `15000` | Max characters from optional functional spec context |

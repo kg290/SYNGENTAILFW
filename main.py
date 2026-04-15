@@ -165,6 +165,8 @@ def setup_logging(verbose: bool, ui: CLIUI) -> logging.Logger:
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("google").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    logging.getLogger("PIL").setLevel(logging.WARNING)
     return logging.getLogger(__name__)
 
 
@@ -191,6 +193,9 @@ def discover_artifacts(
     logger: logging.Logger,
 ) -> tuple[dict[str, list[Path]], Path | None, ZipHandler | None]:
     """Discover artifacts and return (artifacts, iflow_path, zip_handler_if_used)."""
+    def collect_all_files(root: Path) -> list[Path]:
+        return [path for path in root.rglob("*") if path.is_file()]
+
     zip_handler: ZipHandler | None = None
 
     if input_path.is_file() and input_path.suffix.lower() == ".zip":
@@ -198,11 +203,14 @@ def discover_artifacts(
         zip_handler = ZipHandler(str(input_path))
         zip_handler.extract()
         artifacts = zip_handler.discover_artifacts()
+        if zip_handler.extract_dir is not None and zip_handler.extract_dir.exists():
+            artifacts["all_files"] = collect_all_files(zip_handler.extract_dir)
         iflow_path = zip_handler.get_iflow_path()
         return artifacts, iflow_path, zip_handler
 
     logger.info("Processing directory...")
     artifacts = extract_from_directory(input_path)
+    artifacts["all_files"] = collect_all_files(input_path)
     iflows = artifacts.get("iflow", [])
     iflow_path = iflows[0] if iflows else None
     return artifacts, iflow_path, None
@@ -349,6 +357,12 @@ def process_iflow(
         logger.info(f"Processing: {input_path}")
         artifacts, iflow_path, zip_handler = discover_artifacts(input_path, logger)
 
+        project_analysis_root = input_path if input_path.is_dir() else input_path.parent
+        if zip_handler is not None and zip_handler.extract_dir is not None:
+            project_analysis_root = zip_handler.extract_dir
+
+        logger.info(f"Discovered {len(artifacts.get('all_files', []))} total file(s) for analysis")
+
         if not iflow_path:
             raise ValueError("No iFlow file (.iflw) found in input")
 
@@ -366,11 +380,15 @@ def process_iflow(
 
         # Step 3: Extract artifacts
         logger.info("Extracting artifacts...")
-        extracted_artifacts = extract_all_artifacts(artifacts)
+        extracted_artifacts = extract_all_artifacts(
+            artifacts,
+            project_root=project_analysis_root,
+        )
         groovy_scripts = extracted_artifacts.get("groovy_scripts", [])
 
         # Optional: load functional specification context to enrich AI prompt.
         functional_spec_context = ""
+        functional_spec_analysis: dict[str, Any] = {}
         selected_functional_spec = functional_spec_path
         if selected_functional_spec is None:
             discovery_anchor: Path = input_path
@@ -395,6 +413,10 @@ def process_iflow(
             )
 
             functional_spec_context = str(spec_result.get("context", ""))
+            llm_context = spec_result.get("llm_context", "")
+            if isinstance(llm_context, str) and llm_context.strip():
+                functional_spec_context = llm_context.strip()
+            functional_spec_analysis = spec_result.get("analysis", {}) or {}
             loaded_files = spec_result.get("loaded_files", [])
             ignored_files = spec_result.get("ignored_files", [])
             warnings = spec_result.get("warnings", [])
@@ -435,9 +457,14 @@ def process_iflow(
             schemas=extracted_artifacts.get("schemas", []),
             parameters=extracted_artifacts.get("parameters", {}),
             parameter_definitions=extracted_artifacts.get("parameter_definitions", {}),
+            all_files=extracted_artifacts.get("all_files", []),
+            file_type_summary=extracted_artifacts.get("file_type_summary", {}),
+            text_artifacts=extracted_artifacts.get("text_artifacts", []),
+            artifact_analysis_context=extracted_artifacts.get("artifact_analysis_context", ""),
             output_dir=output_dir,
             include_diagrams=True,
             functional_spec_context=functional_spec_context,
+            functional_spec_analysis=functional_spec_analysis,
         )
 
         # Log AI stats
@@ -561,6 +588,23 @@ def command_validate(args: argparse.Namespace, ui: CLIUI) -> int:
             max_chars=2000,
             logger=logger,
         )
+        analysis = result.get("analysis", {})
+        req_count = (
+            len(analysis.get("business_requirements", []))
+            if isinstance(analysis.get("business_requirements", []), list)
+            else 0
+        )
+        iface_count = (
+            len(analysis.get("interface_points", []))
+            if isinstance(analysis.get("interface_points", []), list)
+            else 0
+        )
+        section_count = (
+            len(analysis.get("section_map", []))
+            if isinstance(analysis.get("section_map", []), list)
+            else 0
+        )
+        llm_context_len = len(str(result.get("llm_context", "")))
 
         ui.key_values(
             "Functional Spec Validation",
@@ -569,6 +613,10 @@ def command_validate(args: argparse.Namespace, ui: CLIUI) -> int:
                 ("Ignored files", str(len(result.get("ignored_files", [])))),
                 ("Warnings", str(len(result.get("warnings", [])))),
                 ("Truncated", str(bool(result.get("truncated", False)))),
+                ("Requirement signals", str(req_count)),
+                ("Interface signals", str(iface_count)),
+                ("Section blocks", str(section_count)),
+                ("LLM context chars", str(llm_context_len)),
             ],
         )
     else:
@@ -764,6 +812,7 @@ def command_config(args: argparse.Namespace, ui: CLIUI) -> int:
         ("USE_THINKING_MODEL", str(app_settings.USE_THINKING_MODEL)),
         ("DOC_AUTHOR", app_settings.DOC_AUTHOR),
         ("DOC_VERSION", app_settings.DOC_VERSION),
+        ("TECH_SPEC_SCOPE_MODE", app_settings.TECH_SPEC_SCOPE_MODE),
         ("FUNCTIONAL_SPEC_MAX_CHARS", str(app_settings.FUNCTIONAL_SPEC_MAX_CHARS)),
     ]
 
@@ -1057,13 +1106,13 @@ Examples:
   python main.py project.zip
   python main.py run project.zip -o output --verbose
   python main.py validate project.zip
-  python main.py inspect sample/Sample 1
+    python main.py inspect ./integration_project
   python main.py diagrams project.zip -o output
   python main.py diagnostics
   python main.py cache show
   python main.py cache clear
   python main.py config show
-  python main.py inputs sample
+    python main.py inputs .
 
 Legacy compatibility:
   python main.py <input_path> [output_path] [run options]

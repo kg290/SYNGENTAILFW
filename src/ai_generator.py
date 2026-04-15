@@ -2,7 +2,7 @@
 AI Generator - Optimized version with batch processing, streaming, and improved prompts.
 
 Key Improvements:
-- Batch API calls: 14 calls → 1-2 calls
+- Batch API calls: 14 calls to 1-2 calls
 - Streaming responses for better UX
 - Structured JSON output
 - Gemini 2.0 Flash Thinking support
@@ -54,11 +54,17 @@ COMPREHENSIVE_BATCH_PROMPT = """You are an expert SAP CPI Integration Suite tech
 ## Groovy Scripts:
 {groovy_scripts_info}
 
-## Optional Functional Specification Context:
+## Functional Specification Source Context:
 {functional_spec_info}
 
+## Functional Specification Structured Analysis:
+{functional_spec_analysis_info}
+
+## Project File Analysis Context (all discovered files):
+{artifact_analysis_info}
+
 ## Your Task:
-Generate a COMPLETE technical specification following enterprise standards. Analyze the XML thoroughly and extract ALL information.
+Generate a COMPLETE technical specification following enterprise standards. Analyze the iFlow XML, all supplied artifacts, and functional-spec evidence thoroughly.
 
 Return a JSON object with these EXACT keys (analyze XML carefully for each):
 
@@ -93,6 +99,12 @@ Return a JSON object with these EXACT keys (analyze XML carefully for each):
     "processing_type": "Sync/Async, XML/JSON/etc",
     "performance": "Expected performance requirements"
   }},
+
+    "functional_spec_alignment": {{
+        "requirement_traceability": ["Requirement signals from functional spec and where they appear in iFlow/artifacts"],
+        "assumptions_used": ["Assumptions inferred from functional spec and supported by technical artifacts"],
+        "open_questions": ["Gaps or ambiguities that are not explicit in artifacts"]
+    }},
   
   "high_level_design": "Technical architecture overview. Describe adapters, protocols, and flow. 3-4 sentences.",
   
@@ -139,6 +151,12 @@ Return a JSON object with these EXACT keys (analyze XML carefully for each):
     "target_format": "XML/JSON/CSV/etc",
     "transformations": ["List of key transformations"]
   }},
+
+    "artifact_coverage": {{
+        "analyzed_file_types": ["Key file types analyzed across the provided folder"],
+        "critical_non_iflow_artifacts": ["Important files beyond .iflw and why they matter"],
+        "observations": ["Technical observations grounded in those files"]
+    }},
   
   "groovy_scripts": {{
     "overview": "How Groovy scripts are used in this iFlow. 2 sentences.",
@@ -180,12 +198,13 @@ Return a JSON object with these EXACT keys (analyze XML carefully for each):
 
 CRITICAL INSTRUCTIONS:
 1. Return ONLY valid JSON - no markdown, no code blocks, no explanations
-2. Analyze the XML THOROUGHLY - extract real values, don't make up data
+2. Analyze XML and supplied artifact context THOROUGHLY - extract real values, don't make up data
 3. If a field has no data in XML, say "Not configured" or "Not found in iFlow"
 4. Be SPECIFIC - use actual names, values, and configurations from the XML
 5. For scripts, describe what they ACTUALLY do based on the code
-6. Use functional-spec context to improve business and process understanding, but do not contradict explicit iFlow XML technical configuration
+6. Use functional-spec context and structured analysis to improve business/process understanding, but do not contradict explicit iFlow XML technical configuration
 7. Ensure all JSON keys use double quotes and strings are properly escaped
+8. Include meaningful requirement traceability and artifact coverage grounded in provided evidence
 """
 
 
@@ -397,6 +416,8 @@ class AIGenerator:
         xml_content: str,
         groovy_scripts: Optional[List[Dict[str, Any]]] = None,
         functional_spec_context: str = "",
+        functional_spec_analysis: Optional[Dict[str, Any]] = None,
+        artifact_analysis_context: str = "",
     ) -> Optional[Dict[str, Any]]:
         """
         Generate ALL specification sections in a SINGLE API call.
@@ -438,6 +459,41 @@ class AIGenerator:
                 logger.warning(
                     f"Functional spec context truncated to {max_functional_chars} chars"
                 )
+
+        functional_spec_analysis_info = "Not provided."
+        if functional_spec_analysis:
+            try:
+                rendered_analysis = json.dumps(
+                    functional_spec_analysis,
+                    ensure_ascii=True,
+                    indent=2,
+                )
+            except Exception:
+                rendered_analysis = str(functional_spec_analysis)
+
+            max_analysis_chars = 8000
+            functional_spec_analysis_info = rendered_analysis.strip()
+            if len(functional_spec_analysis_info) > max_analysis_chars:
+                functional_spec_analysis_info = (
+                    functional_spec_analysis_info[:max_analysis_chars]
+                    + "\n[Functional specification analysis truncated for processing]"
+                )
+                logger.warning(
+                    f"Functional spec analysis truncated to {max_analysis_chars} chars"
+                )
+
+        artifact_analysis_info = "Not provided."
+        if artifact_analysis_context.strip():
+            max_artifact_chars = 12000
+            artifact_analysis_info = artifact_analysis_context.strip()
+            if len(artifact_analysis_info) > max_artifact_chars:
+                artifact_analysis_info = (
+                    artifact_analysis_info[:max_artifact_chars]
+                    + "\n[Artifact analysis context truncated for processing]"
+                )
+                logger.warning(
+                    f"Artifact analysis context truncated to {max_artifact_chars} chars"
+                )
         
         # Build comprehensive batch prompt
         prompt = COMPREHENSIVE_BATCH_PROMPT.format(
@@ -445,6 +501,8 @@ class AIGenerator:
             xml_content=xml_content,
             groovy_scripts_info=groovy_info,
             functional_spec_info=functional_spec_info,
+            functional_spec_analysis_info=functional_spec_analysis_info,
+            artifact_analysis_info=artifact_analysis_info,
         )
         
         # Check cache
@@ -460,7 +518,7 @@ class AIGenerator:
                 logger.warning("Cached batch response invalid, regenerating")
         
         # Generate batch response
-        logger.info("🚀 Generating complete specification in SINGLE API call...")
+        logger.info("Generating complete specification in SINGLE API call...")
         self.stats["batch_calls"] += 1
         
         response_text = self.generate(prompt, cache_prefix="batch")
@@ -501,7 +559,7 @@ class AIGenerator:
                 'sections': len(result)
             })
             
-            logger.info(f"✅ Batch generation successful - {len(result)} sections generated")
+            logger.info(f"Batch generation successful - {len(result)} sections generated")
             return result
             
         except json.JSONDecodeError as e:

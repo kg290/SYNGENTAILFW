@@ -3,9 +3,33 @@
 
 import sys
 import os
-sys.path.insert(0, 'src')
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+SRC_DIR = BASE_DIR / 'src'
+sys.path.insert(0, str(SRC_DIR))
 
 def run_diagnostics():
+    from config import settings as app_settings
+
+    excluded_dirs = {
+        '.git',
+        'venv',
+        '.venv',
+        '__pycache__',
+        'output',
+        'temp',
+        '.pytest_cache',
+    }
+
+    def discover_iflow_files(search_root: Path):
+        discovered = []
+        for candidate in search_root.rglob('*.iflw'):
+            if any(part in excluded_dirs for part in candidate.parts):
+                continue
+            discovered.append(candidate)
+        return sorted(discovered, key=lambda p: str(p).lower())
+
     print('=' * 60)
     print('FULL SYSTEM DIAGNOSTICS')
     print('=' * 60)
@@ -47,20 +71,20 @@ def run_diagnostics():
     
     # 3. Check for hardcoded values
     print('\n3. HARDCODING CHECK:')
-    hardcoded = ['Foundation_BusinessDocumentPDF', 'Bravo_Subscriber']
+    sample_iflow_names = [p.stem for p in discover_iflow_files(BASE_DIR)]
     
     files_to_check = [
-        'src/document_builder.py',
-        'src/ai_generator.py',
-        'main.py',
-        'src/diagram_generator.py'
+        BASE_DIR / 'src' / 'document_builder.py',
+        BASE_DIR / 'src' / 'ai_generator.py',
+        BASE_DIR / 'main.py',
+        BASE_DIR / 'src' / 'diagram_generator.py',
     ]
     
     for filepath in files_to_check:
-        if os.path.exists(filepath):
+        if filepath.exists():
             with open(filepath, 'r', encoding='utf-8') as f:
                 content = f.read()
-            found = [h for h in hardcoded if h in content]
+            found = [name for name in sample_iflow_names if name and name in content]
             if found:
                 print(f'   [WARN] Hardcoded in {filepath}: {found}')
             else:
@@ -69,13 +93,15 @@ def run_diagnostics():
     # 4. Test parser with sample
     print('\n4. PARSER TEST:')
     from iflow_parser import IFlowParser
-    from pathlib import Path
     
-    # Find the iFlow file in sample directory
-    sample_dir = Path('sample')
-    iflow_files = list(sample_dir.rglob('*.iflw'))
+    # Find an iFlow file dynamically across the workspace.
+    preferred_root = BASE_DIR / 'sample'
+    iflow_files = discover_iflow_files(preferred_root) if preferred_root.exists() else []
     if not iflow_files:
-        print('   [FAIL] No iFlow files found in sample/')
+        iflow_files = discover_iflow_files(BASE_DIR)
+
+    if not iflow_files:
+        print('   [FAIL] No iFlow files found in the workspace for diagnostics.')
         return False
     
     parser = IFlowParser(iflow_files[0])
@@ -113,14 +139,18 @@ def run_diagnostics():
     
     # 6. API call count check
     print('\n6. API EFFICIENCY:')
-    print('   Original system: 14 API calls')
-    print('   Batch system: 1-2 API calls')
-    print('   Reduction: 93%')
+    print('   Batch generation enabled: optimized call pattern is active when cache misses occur.')
     
     # 7. Document quality check
     print('\n7. OUTPUT VALIDATION:')
-    output_file = 'output/Foundation_BusinessDocumentPDF_Bravo_Subscriber_TechSpec.docx'
-    if os.path.exists(output_file):
+    output_candidates = sorted(
+        app_settings.OUTPUT_DIR.glob('*_TechSpec.docx'),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )
+    output_file = str(output_candidates[0]) if output_candidates else ''
+
+    if output_file and os.path.exists(output_file):
         from docx import Document
         import zipfile
         
@@ -146,7 +176,7 @@ def run_diagnostics():
         else:
             print('   [WARN] Document may be incomplete')
     else:
-        print('   [SKIP] No output file to validate')
+        print(f'   [SKIP] No generated *_TechSpec.docx file found in {app_settings.OUTPUT_DIR}')
     
     print('\n' + '=' * 60)
     print('DIAGNOSTICS COMPLETE')
