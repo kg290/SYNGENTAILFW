@@ -303,10 +303,21 @@ class BPMNDiagramGenerator:
             key = (match.group(1) or match.group(2) or '').replace('\\ ', ' ').strip()
             if not key:
                 return match.group(0)
-            resolved = self._runtime_parameters.get(self._normalize_lookup_key(key), '')
-            return resolved if resolved else match.group(0)
+            lookup = self._normalize_lookup_key(key)
+            if lookup not in self._runtime_parameters:
+                return match.group(0)
+            return self._decode_runtime_value(self._runtime_parameters.get(lookup, ''))
 
         return pattern.sub(replacer, raw)
+
+    @staticmethod
+    def _decode_runtime_value(value: str) -> str:
+        """Decode common Java-properties escape sequences for display."""
+        rendered = str(value or '')
+        rendered = rendered.replace('\\:', ':')
+        rendered = rendered.replace('\\=', '=')
+        rendered = rendered.replace('\\ ', ' ')
+        return rendered
 
     def _load_runtime_parameters(self, parser) -> None:
         """Load project parameter values near the iFlow for placeholder resolution."""
@@ -348,7 +359,7 @@ class BPMNDiagramGenerator:
                 if not lookup:
                     continue
                 if lookup not in self._runtime_parameters:
-                    self._runtime_parameters[lookup] = value.strip()
+                    self._runtime_parameters[lookup] = self._decode_runtime_value(value.strip())
 
     def _properties_to_map(self, properties: List[List[str]]) -> Dict[str, str]:
         """Convert list-based key/value properties to a normalized dictionary."""
@@ -453,7 +464,7 @@ class BPMNDiagramGenerator:
             add_row('Transport Protocol', ['transport protocol', 'protocol'])
             add_row('Use WS-Addressing', ['use ws-addressing', 'use ws addressing', 'usewsaddressing', 'use w s addressing'])
             add_row('Message Exchange Pattern', ['message exchange pattern', 'message exchange'])
-            add_row('Authorization', ['sender auth type', 'authorization', 'authentication'])
+            add_row('Sender Auth Type', ['sender auth type', 'authorization', 'authentication'])
             add_row('User Role', ['user role'])
             add_row('Quality Of Service', ['quality of service', 'qos'])
         else:
@@ -467,7 +478,11 @@ class BPMNDiagramGenerator:
             add_row('Description', ['description'])
             add_row('Adapter Type', ['component type', 'adapter type', 'name'])
             add_row('Address', ['address', 'url path', 'urlpath', 'endpoint address'])
-            add_row('Authentication', ['authentication'])
+            add_row('Authentication Type', ['authentication'])
+            add_row(
+                'Credential / Security Artifact',
+                ['credential name', 'user name token credential name', 'wsdl user name token credential name'],
+            )
             add_row('Message Protocol', ['message protocol'])
             add_row('Transport Protocol', ['transport protocol', 'protocol'])
             add_row('Operation', ['operation name', 'operation', 's3 receiver operation'])
@@ -658,6 +673,94 @@ class BPMNDiagramGenerator:
             value_text.set_clip_path(panel)
 
             row_cursor_y += (row['line_count'] * row_line_h) + row_padding
+
+    def generate_adapter_panel_diagram(self, properties: List[List[str]], direction: str) -> Optional[bytes]:
+        """Generate a standalone sender/receiver configuration panel image."""
+        try:
+            panel_data = self._build_adapter_panel(properties, direction)
+            rows: List[Tuple[str, str]] = panel_data.get('rows', [])
+            wrapped_rows: List[List[str]] = []
+            for label, value in rows:
+                wrapped_rows.append([
+                    textwrap.fill(str(label), width=22, break_long_words=False, break_on_hyphens=False),
+                    textwrap.fill(str(value), width=30, break_long_words=True, break_on_hyphens=True),
+                ])
+
+            row_count = max(1, len(wrapped_rows))
+            fig_h = min(8.0, max(3.6, 1.6 + (row_count * 0.55)))
+            fig, ax = plt.subplots(1, 1, figsize=(8.1, fig_h))
+            ax.set_facecolor(self.WHITE)
+            fig.patch.set_facecolor(self.WHITE)
+            ax.axis('off')
+
+            title = str(panel_data.get('title', f'{direction} Configuration'))
+            subtitle = str(panel_data.get('subtitle', 'Not configured'))
+            subtitle_label = str(panel_data.get('subtitle_label', 'Context'))
+
+            ax.text(
+                0.05,
+                0.95,
+                title,
+                transform=ax.transAxes,
+                ha='left',
+                va='top',
+                fontsize=16,
+                fontweight='bold',
+                color='#2A4A70',
+            )
+            ax.text(
+                0.05,
+                0.87,
+                f"{subtitle_label}: {subtitle}",
+                transform=ax.transAxes,
+                ha='left',
+                va='top',
+                fontsize=10.5,
+                color='#43576C',
+            )
+
+            table = ax.table(
+                cellText=wrapped_rows if wrapped_rows else [["Status", "No adapter details found"]],
+                colLabels=["Property", "Value"],
+                cellLoc='left',
+                colLoc='left',
+                bbox=[0.05, 0.06, 0.90, 0.72],
+                colWidths=[0.34, 0.58],
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1, 1.35)
+
+            for (row_idx, col_idx), cell in table.get_celld().items():
+                cell.set_edgecolor('#D7E1EB')
+                cell.set_linewidth(0.8)
+                if row_idx == 0:
+                    cell.set_facecolor('#E8F2FC')
+                    cell.set_text_props(weight='bold', color='#2A4A70')
+                else:
+                    if col_idx == 0:
+                        cell.set_text_props(weight='bold', color='#334455')
+                    else:
+                        cell.set_text_props(color='#334455')
+                    cell.set_facecolor('#FFFFFF' if row_idx % 2 == 1 else '#F8FBFE')
+
+            plt.tight_layout()
+
+            buf = io.BytesIO()
+            fig.savefig(
+                buf,
+                format='png',
+                dpi=self.dpi,
+                bbox_inches='tight',
+                facecolor=self.WHITE,
+                edgecolor='none',
+            )
+            buf.seek(0)
+            plt.close(fig)
+            return buf.getvalue()
+        except Exception as exc:
+            logger.error(f"{direction} adapter panel diagram error: {exc}")
+            return None
 
     @staticmethod
     def _to_float(value: Any) -> Optional[float]:
@@ -1117,11 +1220,9 @@ class BPMNDiagramGenerator:
             ax.set_facecolor(self.WHITE)
             fig.patch.set_facecolor(self.WHITE)
 
-            left_panel_gutter = max(220.0, min(360.0, diagram_w * 0.24))
-            right_panel_gutter = max(220.0, min(380.0, diagram_w * 0.24))
             pad = max(20.0, min(32.0, max(diagram_w, diagram_h) * 0.03))
-            canvas_left = min_x - pad - left_panel_gutter
-            canvas_right = max_x + pad + right_panel_gutter
+            canvas_left = min_x - pad
+            canvas_right = max_x + pad
             ax.set_xlim(canvas_left, canvas_right)
             ax.set_ylim(max_y + pad, min_y - pad)  # inverted y-axis to match BPMN canvas
             ax.axis('off')
@@ -1310,64 +1411,6 @@ class BPMNDiagramGenerator:
                         ha='center',
                         va='center',
                         zorder=8,
-                    )
-
-            # Add sender/receiver adapter detail panels in side whitespace areas.
-            if process_pool_bounds:
-                try:
-                    sender_props = parser.extract_sender_properties()
-                    receiver_props = parser.extract_receiver_properties()
-                except Exception as panel_exc:
-                    logger.debug(f"Unable to extract sender/receiver properties for side panels: {panel_exc}")
-                    sender_props = []
-                    receiver_props = []
-
-                sender_panel = self._build_adapter_panel(sender_props, 'Sender')
-                receiver_panel = self._build_adapter_panel(receiver_props, 'Receiver')
-
-                lower_threshold_y = process_pool_bounds['y'] + (process_pool_bounds['h'] * 0.55)
-                process_bottom = process_pool_bounds['y'] + process_pool_bounds['h']
-
-                side_anchor_bounds: List[Dict[str, float]] = []
-                for participant_id in participant_ids:
-                    if participant_id == process_pool_id:
-                        continue
-                    bounds = shapes.get(participant_id)
-                    if not bounds:
-                        continue
-                    if bounds['y'] >= lower_threshold_y or (bounds['y'] + bounds['h']) >= process_bottom:
-                        side_anchor_bounds.append(bounds)
-
-                if side_anchor_bounds:
-                    left_anchor = min(bounds['x'] for bounds in side_anchor_bounds)
-                    right_anchor = max(bounds['x'] + bounds['w'] for bounds in side_anchor_bounds)
-                    panel_y = min(bounds['y'] for bounds in side_anchor_bounds) + 4.0
-                else:
-                    left_anchor = process_pool_bounds['x']
-                    right_anchor = process_pool_bounds['x'] + process_pool_bounds['w']
-                    panel_y = process_pool_bounds['y'] + (process_pool_bounds['h'] * 0.56)
-
-                left_space = left_anchor - canvas_left
-                right_space = canvas_right - right_anchor
-
-                if left_space >= 180:
-                    left_width = min(350.0, max(240.0, left_space - 14.0))
-                    self._draw_adapter_side_panel(
-                        ax,
-                        x=canvas_left + 12.0,
-                        y=panel_y,
-                        width=left_width,
-                        panel_data=sender_panel,
-                    )
-
-                if right_space >= 180:
-                    right_width = min(420.0, max(280.0, right_space - 16.0))
-                    self._draw_adapter_side_panel(
-                        ax,
-                        x=canvas_right - right_width - 12.0,
-                        y=panel_y,
-                        width=right_width,
-                        panel_data=receiver_panel,
                     )
 
             plt.tight_layout()
@@ -1579,12 +1622,44 @@ def generate_diagram_bytes(parser, diagram_type: str = "integration_flow") -> Op
             processes = parser.get_integration_processes()
             sequence_flows = parser.extract_sequence_flows_with_names()
             return generator.generate_integration_flow_diagram(processes, sequence_flows)
+
+        if diagram_type == "sender":
+            generator._load_runtime_parameters(parser)
+            return generator.generate_adapter_panel_diagram(
+                parser.extract_sender_properties(),
+                "Sender",
+            )
+
+        if diagram_type == "receiver":
+            generator._load_runtime_parameters(parser)
+            return generator.generate_adapter_panel_diagram(
+                parser.extract_receiver_properties(),
+                "Receiver",
+            )
         
         logger.warning(f"Unknown diagram type: {diagram_type}")
         return None
             
     except Exception as e:
         logger.error(f"Error generating {diagram_type} diagram: {e}")
+        return None
+
+
+def generate_process_diagram_bytes(parser, process: Dict[str, Any]) -> Optional[bytes]:
+    """Generate a compact diagram for a single integration/local process."""
+    try:
+        if not isinstance(process, dict):
+            return None
+
+        process_elem = process.get("element")
+        if process_elem is None:
+            return None
+
+        generator = BPMNDiagramGenerator(parser.iflow_name)
+        sequence_flows = parser.extract_sequence_flows_for_process(process_elem)
+        return generator.generate_integration_flow_diagram([process], sequence_flows)
+    except Exception as e:
+        logger.error(f"Error generating process diagram: {e}")
         return None
 
 
@@ -1650,12 +1725,9 @@ def extract_exception_subdiagram_bytes(parser, integration_diagram_bytes: bytes)
         diagram_w = max(max_x - min_x, 1.0)
         diagram_h = max(max_y - min_y, 1.0)
 
-        left_panel_gutter = max(220.0, min(360.0, diagram_w * 0.24))
-        right_panel_gutter = max(220.0, min(380.0, diagram_w * 0.24))
         pad = max(20.0, min(32.0, max(diagram_w, diagram_h) * 0.03))
-
-        canvas_left = min_x - pad - left_panel_gutter
-        canvas_right = max_x + pad + right_panel_gutter
+        canvas_left = min_x - pad
+        canvas_right = max_x + pad
         canvas_top = min_y - pad
         canvas_bottom = max_y + pad
 
@@ -1760,7 +1832,7 @@ def generate_iflow_diagrams(parser, output_dir: Optional[Path] = None) -> Dict[s
     results = {}
     safe_name = "".join(c for c in parser.iflow_name if c.isalnum() or c in "._- ")
     
-    for dtype in ['integration_flow']:
+    for dtype in ['integration_flow', 'sender', 'receiver']:
         try:
             img_bytes = generate_diagram_bytes(parser, dtype)
             if img_bytes:

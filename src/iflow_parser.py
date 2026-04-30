@@ -19,12 +19,36 @@ NS = {
     'ifl': 'http:///com.sap.ifl.model/Ifl.xsd',
 }
 
+DISPLAY_SKIP_KEYS = {
+    "headertable",
+    "propertytable",
+    "cmdvarianturi",
+    "componentversion",
+    "activitytype",
+    "componentns",
+    "componentswcvname",
+    "componentswcvid",
+}
+
 
 def format_key(key: str) -> str:
     """Convert camelCase/snake_case to Title Case."""
     key = key.replace("_", " ")
     key = re.sub(r"(?<!^)(?=[A-Z])", " ", key)
     return key.title()
+
+
+def should_display_property(key: str, value: Optional[str]) -> bool:
+    """Return True when a property is useful for document display."""
+    normalized = re.sub(r'[^a-z0-9]+', '', str(key or '').strip().lower())
+    rendered = str(value or '').strip()
+    if not normalized or not rendered:
+        return False
+    if normalized in DISPLAY_SKIP_KEYS:
+        return False
+    if "<row>" in rendered and "<cell" in rendered:
+        return False
+    return True
 
 
 class IFlowParser:
@@ -77,7 +101,7 @@ class IFlowParser:
         for ext in elem.findall(".//{http:///com.sap.ifl.model/Ifl.xsd}property"):
             key = ext.findtext("key")
             value = ext.findtext("value")
-            if key:
+            if key and should_display_property(key, value):
                 props.append([format_key(key), value if value else ""])
         return props
     
@@ -174,6 +198,17 @@ class IFlowParser:
         """Get all integration processes with their info."""
         processes = self.get_all_processes()
         return [self.get_process_info(p) for p in processes]
+
+    def get_local_integration_processes(self) -> List[Dict[str, Any]]:
+        """Get local integration processes represented as subprocesses."""
+        local_processes: List[Dict[str, Any]] = []
+        for process in self.get_all_processes():
+            parent_name = process.attrib.get('name', process.attrib.get('id', 'Integration Process'))
+            for sub_process in process.findall(".//{http://www.omg.org/spec/BPMN/20100524/MODEL}subProcess"):
+                info = self.get_process_info(sub_process)
+                info['parent_process'] = parent_name
+                local_processes.append(info)
+        return local_processes
     
     def extract_all_processes_xml(self) -> List[Dict[str, str]]:
         """Extract all processes as list with name and XML."""
@@ -208,16 +243,53 @@ class IFlowParser:
             child_name = child.attrib.get("name", "")
             heading = f"{tag_name} {child_name}".strip()
             props = []
+            activity_type = ""
             for ext_elem in child:
                 if ext_elem.tag.endswith("extensionElements"):
                     for prop in ext_elem:
                         if prop.tag.endswith("property"):
                             key = prop.findtext("key")
                             value = prop.findtext("value")
-                            if key:
+                            normalized_key = re.sub(r'[^a-z0-9]+', '', str(key or '').strip().lower())
+                            if normalized_key == "activitytype" and value:
+                                activity_type = value.strip()
+                            if key and should_display_property(key, value):
                                 props.append([format_key(key), value if value else ""])
-            results.append({"heading": heading, "properties": props})
+            results.append(
+                {
+                    "tag": tag_name,
+                    "name": child_name,
+                    "heading": heading,
+                    "activity_type": activity_type,
+                    "properties": props,
+                }
+            )
         return results
+
+    def extract_sequence_flows_for_process(self, process_elem: ET.Element) -> List[Tuple[str, str, str]]:
+        """Extract sequence flows scoped to a specific process element."""
+        id_name = self.build_id_name_map()
+        element_ids = {
+            elem.attrib.get("id", "")
+            for elem in process_elem.iter()
+            if elem.attrib.get("id")
+        }
+
+        flows: List[Tuple[str, str, str]] = []
+        for seq in process_elem.findall(".//bpmn2:sequenceFlow", NS):
+            source_id = seq.attrib.get("sourceRef") or ""
+            target_id = seq.attrib.get("targetRef") or ""
+            if source_id and source_id not in element_ids:
+                continue
+            if target_id and target_id not in element_ids:
+                continue
+
+            source_name = id_name.get(source_id, source_id)
+            target_name = id_name.get(target_id, target_id)
+            name = seq.attrib.get("name") or ""
+            flows.append((source_name, target_name, name))
+
+        return flows
     
     def extract_sender_properties(self) -> List[List[str]]:
         """Extract sender adapter properties."""
@@ -236,7 +308,7 @@ class IFlowParser:
                     for prop in ext_elem.findall("ifl:property", NS):
                         key = prop.findtext("key")
                         value = prop.findtext("value")
-                        if key:
+                        if key and should_display_property(key, value):
                             sender_props.append([format_key(key), value if value else ""])
         return sender_props
     
@@ -257,7 +329,7 @@ class IFlowParser:
                     for prop in ext_elem.findall("ifl:property", NS):
                         key = prop.findtext("key")
                         value = prop.findtext("value")
-                        if key:
+                        if key and should_display_property(key, value):
                             receiver_props.append([format_key(key), value if value else ""])
         return receiver_props
     
@@ -300,7 +372,7 @@ class IFlowParser:
                         for p in ext_elem.findall("ifl:property", NS):
                             k = p.findtext("key")
                             v = p.findtext("value")
-                            if k:
+                            if k and should_display_property(k, v):
                                 subproc_props.append([k, v if v else ""])
                         exc_data = {"subproc_props": subproc_props, "children": []}
                         for child in list(sub_proc):
@@ -309,7 +381,7 @@ class IFlowParser:
                                 for prop in ext_elem_child.findall("ifl:property", NS):
                                     k = prop.findtext("key")
                                     v = prop.findtext("value")
-                                    if k:
+                                    if k and should_display_property(k, v):
                                         child_props.append([k, v if v else ""])
                                 if child_props:
                                     exc_data["children"].append({
@@ -329,8 +401,7 @@ class IFlowParser:
             key = prop.findtext("key")
             value = prop.findtext("value")
             if key and value:
-                if key.lower() in ["componentversion", "author", "description", 
-                                   "componentns", "componentswcvname", "componentswcvid"]:
+                if key.lower() in ["componentversion", "author", "description"]:
                     metadata[key] = value
         return metadata
     

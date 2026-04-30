@@ -13,7 +13,7 @@ Features:
 """
 
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 import sys
 import logging
@@ -58,17 +58,65 @@ class EnterpriseDocumentBuilder:
     TABLE_HEADER_BG = "005293"
     TABLE_ALT_ROW = "F5F8FA"
     
-    def __init__(self, iflow_name: str, output_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        iflow_name: str,
+        output_dir: Optional[Path] = None,
+        runtime_parameters: Optional[Dict[str, str]] = None,
+    ):
         self.iflow_name = iflow_name
         self.output_dir = output_dir or OUTPUT_DIR
         self.output_dir.mkdir(exist_ok=True)
         self.doc = Document()
         self._bookmark_id_counter = 1
+        self._runtime_parameters = self._normalize_runtime_parameters(runtime_parameters or {})
         self._ensure_wordml_namespaces()
         self._setup_page()
         self._set_modern_compatibility_mode()
         self._setup_header_footer()
-        # Keep field updates manual to avoid Word's update-fields prompt on open.
+        self._disable_auto_field_updates()
+
+    @staticmethod
+    def _normalize_lookup_key(value: str) -> str:
+        """Normalize property keys to robust lookup tokens."""
+        return re.sub(r'[^a-z0-9]+', '', str(value or '').strip().lower())
+
+    def _normalize_runtime_parameters(self, values: Dict[str, str]) -> Dict[str, str]:
+        """Normalize runtime parameter keys for placeholder resolution."""
+        normalized: Dict[str, str] = {}
+        for key, value in values.items():
+            lookup = self._normalize_lookup_key(str(key))
+            if lookup and lookup not in normalized:
+                normalized[lookup] = self._decode_runtime_value(str(value))
+        return normalized
+
+    @staticmethod
+    def _decode_runtime_value(value: str) -> str:
+        """Decode common Java-properties escape sequences for display."""
+        rendered = str(value or '')
+        rendered = rendered.replace('\\:', ':')
+        rendered = rendered.replace('\\=', '=')
+        rendered = rendered.replace('\\ ', ' ')
+        return rendered
+
+    def _resolve_runtime_placeholders(self, value: str) -> str:
+        """Resolve ${...} and {{...}} placeholders using runtime parameters."""
+        raw = str(value or '')
+        if not raw:
+            return raw
+
+        pattern = re.compile(r'\$\{([^}]+)\}|\{\{([^}]+)\}\}')
+
+        def replacer(match: re.Match[str]) -> str:
+            key = (match.group(1) or match.group(2) or '').replace('\\ ', ' ').strip()
+            if not key:
+                return match.group(0)
+            lookup = self._normalize_lookup_key(key)
+            if lookup not in self._runtime_parameters:
+                return match.group(0)
+            return self._runtime_parameters.get(lookup, '')
+
+        return pattern.sub(replacer, self._decode_runtime_value(raw))
 
     def _ensure_wordml_namespaces(self):
         """Ensure helper namespace map supports w15 element creation."""
@@ -143,9 +191,9 @@ class EnterpriseDocumentBuilder:
         footer_para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
         footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
         footer_para.add_run("Page ")
-        self._append_field(footer_para, "PAGE")
+        self._append_field(footer_para, "PAGE", "1")
         footer_para.add_run(" of ")
-        self._append_field(footer_para, "NUMPAGES")
+        self._append_field(footer_para, "NUMPAGES", "1")
 
         for run in footer_para.runs:
             run.font.name = 'Calibri'
@@ -160,6 +208,13 @@ class EnterpriseDocumentBuilder:
             update_fields = OxmlElement('w:updateFields')
             settings.append(update_fields)
         update_fields.set(qn('w:val'), 'true')
+
+    def _disable_auto_field_updates(self):
+        """Remove the open-time field update flag to avoid Word prompt on open."""
+        settings = self.doc.settings.element
+        update_fields = settings.find(qn('w:updateFields'))
+        if update_fields is not None:
+            settings.remove(update_fields)
     
     def _set_cell_shading(self, cell, color_hex: str):
         """Set background color for a table cell."""
@@ -250,28 +305,22 @@ class EnterpriseDocumentBuilder:
         run.font.color.rgb = self.DARK_TEXT
         
         # More spacing
-        for _ in range(8):
+        for _ in range(6):
             self.doc.add_paragraph()
-        
-        # Metadata table
-        table = self.doc.add_table(rows=4, cols=2)
-        table.alignment = WD_TABLE_ALIGNMENT.CENTER
-        
-        meta = [
-            ("Version:", DOC_VERSION),
-            ("Author:", DOC_AUTHOR),
-            ("Date:", datetime.today().strftime("%B %d, %Y")),
-            ("Status:", "Draft")
+
+        meta_lines = [
+            f"Version: {DOC_VERSION}",
+            f"Author: {DOC_AUTHOR}",
+            f"Date: {datetime.today().strftime('%B %d, %Y')}",
+            "Status: Draft",
         ]
-        
-        for i, (key, val) in enumerate(meta):
-            table.rows[i].cells[0].text = key
-            table.rows[i].cells[1].text = val
-            for para in table.rows[i].cells[0].paragraphs:
-                para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                for r in para.runs:
-                    r.bold = True
-                    r.font.color.rgb = self.MUTED_TEXT
+        for line in meta_lines:
+            p = self.doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run(line)
+            run.font.name = 'Calibri'
+            run.font.size = Pt(11)
+            run.font.color.rgb = self.MUTED_TEXT
         
         self.doc.add_page_break()
     
@@ -362,7 +411,7 @@ class EnterpriseDocumentBuilder:
     def add_paragraph(self, text: str, bold: bool = False, italic: bool = False):
         """Add paragraph."""
         p = self.doc.add_paragraph()
-        run = p.add_run(self._strip_markdown_inline(text))
+        run = p.add_run(self._strip_markdown_inline(self._resolve_runtime_placeholders(text)))
         run.bold = bold
         run.italic = italic
         run.font.name = 'Calibri'
@@ -439,10 +488,30 @@ class EnterpriseDocumentBuilder:
     def add_bullet_list(self, items: List[str]):
         """Add bullet list."""
         for item in items:
-            p = self.doc.add_paragraph(self._strip_markdown_inline(item), style='List Bullet')
+            p = self.doc.add_paragraph(
+                self._strip_markdown_inline(self._resolve_runtime_placeholders(item)),
+                style='List Bullet',
+            )
             for run in p.runs:
                 run.font.name = 'Calibri'
                 run.font.size = Pt(11)
+
+    def add_key_value_bullets(self, rows: List[List[str]]):
+        """Render key/value rows as bullet items instead of a table."""
+        items: List[str] = []
+        for row in rows:
+            if not row:
+                continue
+            key = self._strip_markdown_inline(str(row[0]).strip()) if len(row) >= 1 else ""
+            value = self._strip_markdown_inline(str(row[1]).strip()) if len(row) >= 2 else ""
+            if key and value:
+                items.append(f"{key}: {value}")
+            elif key:
+                items.append(key)
+            elif value:
+                items.append(value)
+        if items:
+            self.add_bullet_list(items)
 
     def add_numbered_list(self, items: List[str]):
         """Add numbered list."""
@@ -492,10 +561,6 @@ class EnterpriseDocumentBuilder:
                 normalized_rows.append(cells)
 
         if not normalized_rows:
-            if caption:
-                p = self.add_paragraph(f"Table: {caption}", bold=True)
-                p.paragraph_format.space_after = Pt(4)
-            self.add_paragraph("No data available.", italic=True)
             return
         
         if caption:
@@ -523,7 +588,7 @@ class EnterpriseDocumentBuilder:
         self._set_row_cant_split(hdr_row)
         for i, hdr_text in enumerate(headers):
             cell = hdr_row.cells[i]
-            cell.text = hdr_text
+            cell.text = self._strip_markdown_inline(self._resolve_runtime_placeholders(hdr_text))
             if column_widths:
                 cell.width = column_widths[i]
             self._set_cell_shading(cell, self.TABLE_HEADER_BG)
@@ -542,7 +607,12 @@ class EnterpriseDocumentBuilder:
             for i, cell_text in enumerate(row_data):
                 if i < num_cols:
                     cell = row.cells[i]
-                    cell.text = self._strip_markdown_inline(str(cell_text)) if cell_text else ""
+                    cell.text = (
+                        self._strip_markdown_inline(
+                            self._resolve_runtime_placeholders(str(cell_text))
+                        )
+                        if cell_text else ""
+                    )
                     if column_widths:
                         cell.width = column_widths[i]
                     if row_idx % 2 == 1:
@@ -639,6 +709,10 @@ def build_specification_document(
 
     iflow_name = parser.iflow_name
     all_processes = parser.get_integration_processes()
+    main_processes = all_processes[:1]
+    # Only additional top-level BPMN processes are treated as local integration processes.
+    # Exception subprocesses stay in the dedicated error-handling section.
+    local_processes = all_processes[1:]
     message_flows = parser.extract_message_flows_with_names()
     sequence_flows = parser.extract_sequence_flows_with_names()
     sender_props = parser.extract_sender_properties()
@@ -648,10 +722,14 @@ def build_specification_document(
     exception_props = parser.extract_exception_properties()
     metadata = parser.extract_metadata()
 
-    builder = EnterpriseDocumentBuilder(iflow_name, output_dir)
+    builder = EnterpriseDocumentBuilder(
+        iflow_name,
+        output_dir,
+        runtime_parameters=parameters,
+    )
 
     print("\n" + "=" * 70)
-    print("  SAP CPI Technical Specification Generator")
+    print("  SAP CI Technical Specification Generator")
     print("=" * 70)
     print(f"  iFlow: {iflow_name}")
     print(f"  Processes: {len(all_processes)}")
@@ -665,12 +743,17 @@ def build_specification_document(
     # GENERATE DIAGRAMS
     # ========================================================================
     diagram_bytes: Dict[str, bytes] = {}
+    local_process_diagrams: List[Tuple[str, bytes]] = []
     if include_diagrams:
         print("\n[INFO] Generating diagrams...")
         try:
-            from src.diagram_generator import generate_diagram_bytes, extract_exception_subdiagram_bytes
+            from src.diagram_generator import (
+                generate_diagram_bytes,
+                extract_exception_subdiagram_bytes,
+                generate_process_diagram_bytes,
+            )
 
-            for dtype in ['integration_flow']:
+            for dtype in ['integration_flow', 'sender', 'receiver']:
                 print(f"   - {dtype.replace('_', ' ').title()}...", end=" ")
                 try:
                     img = generate_diagram_bytes(parser, dtype)
@@ -696,6 +779,20 @@ def build_specification_document(
                         print("[SKIP]")
                 except Exception as e:
                     print(f"[WARN] {e}")
+
+            if local_processes:
+                for idx, process in enumerate(local_processes, start=1):
+                    process_name = str(process.get("name") or f"Local Process {idx}")
+                    print(f"   - Local Process Diagram ({process_name})...", end=" ")
+                    try:
+                        local_img = generate_process_diagram_bytes(parser, process)
+                        if local_img:
+                            local_process_diagrams.append((process_name, local_img))
+                            print("[OK]")
+                        else:
+                            print("[SKIP]")
+                    except Exception as e:
+                        print(f"[WARN] {e}")
         except ImportError as e:
             print(f"   [WARN] Diagrams not available: {e}")
 
@@ -761,6 +858,14 @@ def build_specification_document(
         value = batch.get(key, [])
         return value if isinstance(value, list) else []
 
+    def dict_to_bullets(data: Dict[str, Any]) -> List[str]:
+        items: List[str] = []
+        for k, v in data.items():
+            rendered = value_to_text(v)
+            if rendered:
+                items.append(f"{k.replace('_', ' ').title()}: {rendered}")
+        return items
+
     ai_stats: Dict[str, Any] = {}
     if hasattr(ai_generator, "get_stats"):
         raw_stats = ai_generator.get_stats()
@@ -782,6 +887,306 @@ def build_specification_document(
             rendered = value_to_text(v)
             if rendered:
                 rows.append([k.replace('_', ' ').title(), rendered])
+        return rows
+
+    def props_to_map(rows: List[List[str]]) -> Dict[str, str]:
+        normalized: Dict[str, str] = {}
+        for key, value in rows:
+            lookup = builder._normalize_lookup_key(str(key))
+            rendered = builder._resolve_runtime_placeholders(str(value))
+            if lookup and rendered and lookup not in normalized:
+                normalized[lookup] = rendered
+        return normalized
+
+    def list_artifact_paths(extensions: List[str]) -> List[str]:
+        allowed = {ext.lower() for ext in extensions}
+        matches: List[str] = []
+        for entry in all_files:
+            ext = str(entry.get("extension", "")).lower()
+            rel_path = str(entry.get("relative_path", "")).strip()
+            if rel_path and ext in allowed:
+                matches.append(rel_path)
+        return matches
+
+    def label_from_identifier(text: str) -> str:
+        base = Path(str(text or "")).stem or str(text or "")
+        parts = [part for part in re.split(r'[_\-/]+', base) if part]
+        if not parts:
+            return str(text or "").strip()
+        return " ".join(parts)
+
+    def tidy_mapping_label(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return "Not identified"
+        cleaned = re.sub(r'^(mm|xslt|map)\s+', '', label_from_identifier(raw), flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r'\b(xslt|mapping|mmap)\b', '', cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip(" -_")
+        return cleaned or "Not identified"
+
+    def pick_prop_value(prop_map: Dict[str, str], candidate_keys: List[str], fallback: str = "") -> str:
+        for key in candidate_keys:
+            if key == "_protocol":
+                rendered = build_protocol_value(prop_map).strip()
+            else:
+                rendered = prop_map.get(builder._normalize_lookup_key(key), "").strip()
+            if rendered:
+                return rendered
+        return fallback
+
+    def build_protocol_value(prop_map: Dict[str, str]) -> str:
+        transport = prop_map.get("transportprotocol", "").strip()
+        message = prop_map.get("messageprotocol", "").strip()
+        if not transport:
+            transport = prop_map.get("transportprotocolversion", "").strip()
+        if message.lower() == "none":
+            message = ""
+        if message and transport:
+            return f"{message} over {transport}"
+        return message or transport
+
+    def extract_mapping_relation(mapping_name: str, mapping_path: str) -> Tuple[str, str]:
+        identifier = str(mapping_name or Path(mapping_path).stem or "").strip()
+        raw_parts = [part for part in re.split(r'[_\-/]+', identifier) if part]
+        lower_parts = [part.lower() for part in raw_parts]
+        if lower_parts and lower_parts[0] in {"mm", "xslt", "map"}:
+            raw_parts = raw_parts[1:]
+            lower_parts = lower_parts[1:]
+        if "to" in lower_parts:
+            split_at = lower_parts.index("to")
+            source_label = tidy_mapping_label(" ".join(raw_parts[:split_at]))
+            target_label = tidy_mapping_label(" ".join(raw_parts[split_at + 1:]))
+            return source_label, target_label
+        readable = tidy_mapping_label(identifier)
+        return readable or "Not identified", "Not identified"
+
+    def build_mapping_summary(mapping_name: str, mapping_path: str) -> List[str]:
+        identifier = mapping_name or Path(mapping_path).stem
+        readable = label_from_identifier(identifier)
+        source_label, target_label = extract_mapping_relation(str(mapping_name), str(mapping_path))
+
+        if target_label != "Not identified":
+            line_one = (
+                f"This mapping transforms {source_label} data into the {target_label} structure used later in SAP CI."
+            )
+        else:
+            line_one = f"This mapping applies the configured transformation logic for {readable} within SAP CI."
+
+        line_two = (
+            "It is executed during message processing to reshape the payload before the next handoff."
+        )
+        return [line_one, line_two]
+
+    def filter_display_rows(rows: List[List[str]]) -> List[List[str]]:
+        filtered: List[List[str]] = []
+        skip_keys = {
+            "headertable",
+            "propertytable",
+            "cmdvarianturi",
+            "componentswcvname",
+            "componentswcvid",
+            "componentns",
+            "componentversion",
+            "activitytype",
+            "exprtype",
+            "streaming",
+            "stoponexecution",
+            "splitterthreads",
+            "parallelprocessing",
+            "grouping",
+            "splittype",
+            "timeout",
+        }
+        for key, value in rows:
+            key_text = str(key or "").strip()
+            value_text = builder._resolve_runtime_placeholders(str(value or "")).strip()
+            normalized_key = builder._normalize_lookup_key(key_text)
+            if not key_text or not value_text:
+                continue
+            if normalized_key in skip_keys:
+                continue
+            if "<row>" in value_text and "<cell" in value_text:
+                continue
+            filtered.append([key_text, value_text])
+        return filtered
+
+    def fallback_process_description(process: Dict[str, Any]) -> str:
+        process_elem = process.get("element")
+        if process_elem is None:
+            return ""
+
+        sequence_count = len(parser.extract_sequence_flows_for_process(process_elem))
+        child_names: List[str] = []
+        for child in parser.extract_child_properties(process_elem):
+            child_tag = str(child.get("tag", "")).strip().lower()
+            name = str(child.get("name", "")).strip() or str(child.get("heading", "")).strip()
+            if child_tag in {"sequenceflow", "startevent", "endevent", "extensionelements"}:
+                continue
+            if name and name not in child_names:
+                child_names.append(name)
+
+        summary = f"This process contains {sequence_count} sequence flow(s)."
+        if child_names:
+            summary += " Key activities include " + ", ".join(child_names[:4]) + "."
+        return summary
+
+    def fallback_process_steps(process_elem: Any) -> List[str]:
+        if process_elem is None:
+            return []
+        ordered_nodes: List[str] = []
+        for src, tgt, _ in parser.extract_sequence_flows_for_process(process_elem):
+            for node in (src, tgt):
+                node_text = str(node).strip()
+                node_lower = node_text.lower()
+                if not node_text or "start" in node_lower or "end" in node_lower:
+                    continue
+                if node_text not in ordered_nodes:
+                    ordered_nodes.append(node_text)
+        return [f"{node} is executed within the process flow." for node in ordered_nodes[:6]]
+
+    def build_adapter_description(prop_map: Dict[str, str], direction: str) -> str:
+        system = prop_map.get("system", "") or ("sender system" if direction == "sender" else "receiver system")
+        adapter_type = prop_map.get("componenttype", "") or prop_map.get("name", "") or "configured"
+        protocol = build_protocol_value(prop_map)
+        if direction == "sender":
+            address = pick_prop_value(prop_map, ["address", "urlpath", "addressinbound"])
+        else:
+            address = pick_prop_value(prop_map, ["address", "soapwsdlurl", "url", "urlpath", "host", "alias"])
+        if direction == "sender":
+            parts = [f"The {adapter_type} sender adapter receives messages from {system}."]
+            if address:
+                parts.append(f"It listens on {address}.")
+            if protocol:
+                parts.append(f"It uses {protocol} for inbound communication.")
+            return " ".join(parts)
+
+        auth = prop_map.get("authentication", "")
+        credential = pick_prop_value(prop_map, ["credentialname", "usernametokencredentialname", "alias", "accesskey", "secretkey"])
+        parts = [f"The {adapter_type} receiver adapter sends processed messages to {system}."]
+        if address:
+            parts.append(f"It targets {address}.")
+        if auth:
+            parts.append(f"Authentication type is {auth}.")
+        if credential:
+            parts.append(f"It uses credential/security artifact {credential}.")
+        return " ".join(parts)
+
+    def summarize_processes(processes: List[Dict[str, Any]]) -> List[List[str]]:
+        rows: List[List[str]] = []
+        for process in processes:
+            process_elem = process.get("element")
+            if process_elem is None:
+                continue
+
+            sequence_count = len(parser.extract_sequence_flows_for_process(process_elem))
+            child_count = len(
+                [
+                    child
+                    for child in list(process_elem)
+                    if child.tag.split("}")[-1] not in {"sequenceFlow", "extensionElements"}
+                ]
+            )
+            rows.append(
+                [
+                    str(process.get("name", "Process")),
+                    str(sequence_count),
+                    str(child_count),
+                ]
+            )
+        return rows
+
+    def render_externalized_parameter_rows(values: Dict[str, str]) -> List[List[str]]:
+        rows: List[List[str]] = []
+        for key, value in values.items():
+            rows.append([str(key), builder._resolve_runtime_placeholders(str(value))])
+        return rows
+
+    def parameter_placeholder_names(raw_value: str) -> List[str]:
+        matches = re.findall(r'\$\{([^}]+)\}|\{\{([^}]+)\}\}', str(raw_value or ''))
+        names: List[str] = []
+        for left, right in matches:
+            key = (left or right or "").replace('\\ ', ' ').strip()
+            if key:
+                names.append(key)
+        return names
+
+    def build_parameter_usage_rows(values: Dict[str, str]) -> List[List[str]]:
+        raw_contexts: List[Tuple[str, str]] = []
+
+        for key, value in sender_props:
+            raw_contexts.append((f"Sender - {key}", str(value)))
+        for key, value in receiver_props:
+            raw_contexts.append((f"Receiver - {key}", str(value)))
+        for mapping_idx, mapping in enumerate(mapping_props, start=1):
+            mapping_map = {builder._normalize_lookup_key(str(k)): str(v or "") for k, v in mapping}
+            mapping_name = (
+                mapping_map.get("mappingname")
+                or Path(mapping_map.get("mappinguri", "")).stem
+                or Path(mapping_map.get("mappingpath", "")).stem
+                or f"Mapping {mapping_idx}"
+            )
+            for key, value in mapping:
+                raw_contexts.append((f"Mapping {mapping_name} - {key}", str(value)))
+
+        for process in all_processes:
+            process_name = str(process.get("name") or "Process")
+            process_elem = process.get("element")
+            if process_elem is None:
+                continue
+            for _, key, value in parser.extract_components_from_process(process_elem):
+                raw_contexts.append((f"{process_name} - {key}", str(value)))
+            for child in parser.extract_child_properties(process_elem):
+                child_heading = str(child.get("heading", "")).strip() or process_name
+                for key, value in child.get("properties", []):
+                    raw_contexts.append((f"{process_name} / {child_heading} - {key}", str(value)))
+
+        rows: List[List[str]] = []
+        for key, value in values.items():
+            rendered_value = builder._resolve_runtime_placeholders(str(value))
+            lookup = builder._normalize_lookup_key(str(key))
+            usages: List[str] = []
+            seen_usages: set[str] = set()
+            for context_label, raw_value in raw_contexts:
+                for placeholder in parameter_placeholder_names(raw_value):
+                    if builder._normalize_lookup_key(placeholder) != lookup:
+                        continue
+                    if context_label in seen_usages:
+                        continue
+                    seen_usages.add(context_label)
+                    usages.append(context_label)
+            if not usages:
+                continue
+            rows.append([
+                str(key),
+                rendered_value or "Not configured",
+                "; ".join(usages),
+            ])
+        rows.sort(key=lambda item: item[0].lower())
+        return rows
+
+    def build_adapter_summary_rows(prop_map: Dict[str, str], direction: str) -> List[List[str]]:
+        if direction == "sender":
+            ordered_fields = [
+                ("Path / Address", ["address", "urlpath", "addressinbound"]),
+                ("Adapter Type", ["componenttype", "name"]),
+                ("Protocol", ["_protocol"]),
+                ("Auth Type", ["senderauthtype", "authorization", "authentication"]),
+                ("User Role", ["userrole"]),
+            ]
+        else:
+            ordered_fields = [
+                ("URL / Address", ["address", "soapwsdlurl", "url", "urlpath", "host", "alias"]),
+                ("Adapter Type", ["componenttype", "name"]),
+                ("Authentication Type", ["authentication"]),
+                ("Credential / Security Artifact", ["credentialname", "usernametokencredentialname", "alias", "accesskey", "secretkey"]),
+                ("Operation Name", ["operationname", "operation", "soapservicename", "s3receiveroperation"]),
+            ]
+
+        rows: List[List[str]] = []
+        for label, keys in ordered_fields:
+            value = pick_prop_value(prop_map, keys, "Not configured")
+            rows.append([label, value])
+
         return rows
 
     print("\n[INFO] Building document...")
@@ -809,8 +1214,7 @@ def build_specification_document(
     ])
     if include_traceability_section:
         toc_entries.insert(toc_entries.index("3. High level iFlow Design"), "2.6 Functional Specification Traceability")
-    if dependencies_text:
-        toc_entries.append("3.4 Technical Dependencies")
+    toc_entries.append("3.4 Technical Dependencies")
     toc_entries.extend([
         "4. Message Flow",
         "4.1 Process Flow",
@@ -824,7 +1228,10 @@ def build_specification_document(
     toc_entries.extend([
         "5. Technical Description",
         "5.1 Main Integration Process",
-        "5.2 Local Integration Process",
+    ])
+    if local_processes:
+        toc_entries.append("5.2 Local Integration Process")
+    toc_entries.extend([
         "5.3 Sender",
         "5.4 Receiver",
         "5.5 Mappings",
@@ -835,17 +1242,16 @@ def build_specification_document(
         "7. Appendix",
         "7.1 Technical Artifacts",
         "7.2 Schemas",
-        "7.3 Runtime Parameters",
-        "7.4 Parameter Definitions",
+        "7.3 Externalized Parameters",
     ])
     if is_extended_scope:
         toc_entries.extend([
-            "7.5 Glossary",
-            "7.6 References",
-            "7.7 Generation Statistics",
-            "7.8 File Type Summary",
-            "7.9 File Inventory",
-            "7.10 Artifact Evidence",
+            "7.4 Glossary",
+            "7.5 References",
+            "7.6 Generation Statistics",
+            "7.7 File Type Summary",
+            "7.8 File Inventory",
+            "7.9 Artifact Evidence",
         ])
     builder.add_toc_placeholder(toc_entries)
 
@@ -858,16 +1264,15 @@ def build_specification_document(
     )
 
     builder.add_heading("1.1 Document Control", 2)
-    builder.add_table(
-        ["Attribute", "Value"],
+    builder.add_bullet_list(
         [
-            ["Document ID", f"TS-{iflow_name}"],
-            ["Integration Flow", iflow_name],
-            ["Generated On", datetime.today().strftime("%Y-%m-%d %H:%M")],
-            ["Generation Mode", "Batch" if ENABLE_BATCH_MODE else "Section-by-section"],
-            ["Diagrams Included", "Yes" if include_diagrams else "No"],
-            ["Functional Spec Context", "Provided" if functional_spec_context.strip() else "Not Provided"],
-        ],
+            f"Document ID: TS-{iflow_name}",
+            f"Integration Flow: {iflow_name}",
+            f"Generated On: {datetime.today().strftime('%Y-%m-%d %H:%M')}",
+            f"Generation Mode: {'Batch' if ENABLE_BATCH_MODE else 'Section-by-section'}",
+            f"Diagrams Included: {'Yes' if include_diagrams else 'No'}",
+            f"Functional Spec Context: {'Provided' if functional_spec_context.strip() else 'Not Provided'}",
+        ]
     )
 
     # 2. Overview
@@ -894,7 +1299,7 @@ def build_specification_document(
         ["Sequence Flows", str(len(sequence_flows))],
         ["Groovy Scripts", str(len(groovy_scripts))],
         ["Schemas", str(len(schemas))],
-        ["Runtime Parameters", str(len(parameters))],
+        ["Externalized Parameters", str(len(parameters))],
     ]
     if is_extended_scope:
         snapshot_rows.append(["Total Files Analyzed", str(len(all_files))])
@@ -957,22 +1362,158 @@ def build_specification_document(
     builder.add_paragraph(get_text("tobe_scenario", "The integration automates message processing between source and target landscapes."))
 
     builder.add_heading("3.3 High Level Design", 2)
-    builder.add_paragraph(get_text("high_level_design", "The integration is implemented using SAP Cloud Integration with adapter-based communication."))
+    builder.add_paragraph(get_text("high_level_design", "The integration is implemented using SAP CI with adapter-based communication."))
 
-    if dependencies_text:
+    sender_prop_map = props_to_map(sender_props)
+    receiver_prop_map = props_to_map(receiver_props)
+
+    dependency_items: List[str] = []
+    source_system = (
+        builder._resolve_runtime_placeholders(str(process_flow_data.get("source_system", ""))).strip()
+        or sender_prop_map.get("system", "")
+        or "source system"
+    )
+    target_system = (
+        builder._resolve_runtime_placeholders(str(process_flow_data.get("target_system", ""))).strip()
+        or receiver_prop_map.get("system", "")
+        or "receiver system"
+    )
+    dependency_items.append(
+        f"Runtime platform: SAP CI integration flow '{iflow_name}' orchestrates message exchange from {source_system} to {target_system}."
+    )
+
+    sender_address = pick_prop_value(sender_prop_map, ["address", "urlpath", "addressinbound"])
+    sender_protocol = sender_prop_map.get("transportprotocol", "")
+    sender_message_protocol = sender_prop_map.get("messageprotocol", "")
+    sender_auth = pick_prop_value(sender_prop_map, ["senderauthtype", "authorization", "authentication"])
+    sender_role = pick_prop_value(sender_prop_map, ["userrole"])
+    inbound_parts = []
+    if sender_address:
+        inbound_parts.append(f"path {sender_address}")
+    if sender_protocol or sender_message_protocol:
+        inbound_parts.append(
+            f"{sender_prop_map.get('componenttype', 'Not configured')} adapter using "
+            f"{sender_message_protocol or 'Not configured'} over {sender_protocol or 'Not configured'}"
+        )
+    if sender_auth or sender_role:
+        inbound_parts.append(
+            f"sender auth type {sender_auth or 'Not configured'}"
+            + (f" with role {sender_role}" if sender_role else "")
+        )
+    if inbound_parts:
+        dependency_items.append("Inbound interface dependency: " + "; ".join(inbound_parts) + ".")
+
+    receiver_address = pick_prop_value(receiver_prop_map, ["address", "soapwsdlurl", "url", "urlpath", "host", "alias"])
+
+    receiver_auth = pick_prop_value(receiver_prop_map, ["authentication"])
+    receiver_credential = pick_prop_value(receiver_prop_map, ["credentialname", "usernametokencredentialname", "alias", "accesskey", "secretkey"])
+    fallback_credential = builder._resolve_runtime_placeholders(str(parameters.get("Credential", ""))).strip()
+    if not receiver_credential and fallback_credential:
+        receiver_credential = fallback_credential
+    receiver_operation = pick_prop_value(receiver_prop_map, ["operationname", "operation", "soapservicename", "s3receiveroperation"]) or builder._resolve_runtime_placeholders(
+        str(parameters.get("Operation", ""))
+    ).strip()
+    receiver_processing = receiver_prop_map.get("processing", "") or builder._resolve_runtime_placeholders(
+        str(parameters.get("Processing", ""))
+    ).strip()
+    receiver_ws_security = receiver_prop_map.get("wssecuritytypeoutbound", "")
+    receiver_signature = receiver_prop_map.get("wssecuritysignaturealgorithm", "")
+    receiver_cert = receiver_prop_map.get("recipientx509tokenassertion", "") or receiver_prop_map.get("x509tokenassertion", "")
+    proxy_type = receiver_prop_map.get("proxytype", "")
+    proxy_host = receiver_prop_map.get("proxyhost", "")
+    proxy_port = receiver_prop_map.get("proxyport", "")
+    timeout = receiver_prop_map.get("requesttimeout", "")
+    keep_alive = receiver_prop_map.get("keepconnectionalive", "")
+    outbound_parts = []
+    if receiver_address:
+        outbound_parts.append(f"URL {receiver_address}")
+    if receiver_auth or receiver_credential:
+        outbound_parts.append(
+            f"receiver authentication type {receiver_auth or 'Not configured'}"
+            + (f" with credential/security artifact {receiver_credential}" if receiver_credential else "")
+        )
+    if receiver_operation:
+        outbound_parts.append(f"operation {receiver_operation}")
+    if receiver_processing:
+        outbound_parts.append(f"processing mode {receiver_processing}")
+    if outbound_parts:
+        dependency_items.append("Outbound interface dependency: " + "; ".join(outbound_parts) + ".")
+
+    if sender_auth or sender_role or receiver_auth or receiver_credential:
+        security_dependency_parts: List[str] = []
+        if sender_auth or sender_role:
+            security_dependency_parts.append(
+                f"sender auth type {sender_auth or 'Not configured'}"
+                + (f" with user role {sender_role}" if sender_role else "")
+            )
+        if receiver_auth or receiver_credential:
+            security_dependency_parts.append(
+                f"receiver authentication type {receiver_auth or 'Not configured'}"
+                + (f" with credential/security artifact {receiver_credential}" if receiver_credential else "")
+            )
+        dependency_items.append("Security dependency: " + "; ".join(security_dependency_parts) + ".")
+
+    runtime_security_parts = []
+    if receiver_ws_security:
+        runtime_security_parts.append(f"WS-Security mode {receiver_ws_security}")
+    if receiver_signature:
+        runtime_security_parts.append(f"signature algorithm {receiver_signature}")
+    if receiver_cert:
+        runtime_security_parts.append(f"token profile {receiver_cert}")
+    proxy_parts = [part for part in [proxy_type, proxy_host, proxy_port] if part]
+    if proxy_parts:
+        runtime_security_parts.append(f"proxy {' / '.join(proxy_parts)}")
+    if timeout or keep_alive:
+        runtime_security_parts.append(
+            f"timeout {timeout or 'Not configured'} ms"
+            + (f" and keep-alive {keep_alive}" if keep_alive else "")
+        )
+    if runtime_security_parts:
+        dependency_items.append("Runtime security and network dependency: " + "; ".join(runtime_security_parts) + ".")
+
+    wsdl_paths = list_artifact_paths([".wsdl"])
+    mapping_paths = list_artifact_paths([".xsl", ".xslt", ".mmap"])
+    artifact_parts = []
+    if wsdl_paths:
+        artifact_parts.append("WSDLs " + "; ".join(wsdl_paths[:2]))
+    if mapping_paths:
+        artifact_parts.append("mappings " + "; ".join(mapping_paths[:2]))
+    if artifact_parts:
+        dependency_items.append("Design-time artifacts: " + " | ".join(artifact_parts) + ".")
+
+    groovy_paths = [Path(str(script.get("file_path"))).name for script in groovy_scripts if str(script.get("file_path", "")).strip()]
+    if groovy_paths:
+        dependency_items.append("Custom script artifacts: " + "; ".join(groovy_paths[:4]) + ".")
+
+    if parameters:
+        priority_keys = ["Address", "Address_Mic", "Credential", "Auth", "UserRole", "BusinessObject"]
+        highlighted_params = [
+            key
+            for key in priority_keys
+            if builder._resolve_runtime_placeholders(str(parameters.get(key, ""))).strip()
+        ]
+        dependency_items.append(
+            f"Externalized runtime dependencies: {len(parameters)} parameter(s) supplied"
+            + (f", including {', '.join(highlighted_params)}." if highlighted_params else ".")
+        )
+
+    if not dependency_items and dependencies_text:
+        dependency_items.append(dependencies_text)
+
+    if dependency_items:
         builder.add_heading("3.4 Technical Dependencies", 2)
-        builder.add_paragraph(dependencies_text)
+        builder.add_bullet_list(dependency_items)
 
     # 4. Message Flow
     print("   [6/10] Message Flow...")
     builder.add_page_break()
     builder.add_heading("4. Message Flow", 1)
-    technical_flow_text = get_text(
-        "technical_flow_description",
-        "The message flow follows process-defined sequence flows and message exchanges.",
+    builder.add_paragraph(
+        f"A message comes from {source_system} into SAP CI through the configured sender channel."
     )
-    if not builder.add_numbered_steps_from_text(technical_flow_text):
-        builder.add_paragraph(technical_flow_text)
+    builder.add_paragraph(
+        f"SAP CI processes the payload and sends the final message to {target_system} through the receiver channel."
+    )
 
     if process_flow_data:
         builder.add_heading("4.1 Process Flow", 2)
@@ -983,7 +1524,6 @@ def build_specification_document(
                 [[str(idx + 1), str(step)] for idx, step in enumerate(steps)]
             )
         summary_rows = dict_to_rows({
-            "source_system": process_flow_data.get("source_system", ""),
             "target_system": process_flow_data.get("target_system", ""),
             "trigger": process_flow_data.get("trigger", ""),
         })
@@ -993,14 +1533,14 @@ def build_specification_document(
     if message_flows:
         builder.add_heading("4.2 Message Flow Connections", 2)
         builder.add_table(
-            ["Source", "Target", "Name"],
-            [[src, tgt, name] for src, tgt, name in message_flows],
+            ["Connection", "Name"],
+            [[f"{src} -> {tgt}", name] for src, tgt, name in message_flows],
         )
     elif sequence_flows:
         builder.add_heading("4.2 Sequence Flow Connections", 2)
         builder.add_table(
-            ["Source", "Target", "Label"],
-            [[src, tgt, name] for src, tgt, name in sequence_flows],
+            ["Connection", "Label"],
+            [[f"{src} -> {tgt}", name] for src, tgt, name in sequence_flows],
         )
 
     if 'integration_flow' in diagram_bytes:
@@ -1018,25 +1558,49 @@ def build_specification_document(
         if isinstance(item, dict)
     }
 
-    def render_process_block(processes: List[Dict[str, Any]], heading: str):
+    def render_process_block(
+        processes: List[Dict[str, Any]],
+        heading: str,
+        process_diagrams: Optional[List[Tuple[str, bytes]]] = None,
+    ):
         builder.add_heading(heading, 2)
         if not processes:
             builder.add_paragraph("No processes available in this section.", italic=True)
             return
+
+        if process_diagrams:
+            for process_name, image_bytes in process_diagrams:
+                builder.add_image(image_bytes, width=5.8, caption=f"{process_name} Diagram")
+
+        summary_rows = summarize_processes(processes)
+        if summary_rows:
+            builder.add_table(["Process Name", "Sequence Flows", "Flow Elements"], summary_rows)
 
         for idx, process in enumerate(processes, start=1):
             proc_name = process.get("name", f"Process {idx}")
             builder.add_heading(proc_name, 3)
 
             ai_entry = process_ai.get(proc_name, {})
-            if ai_entry.get("description"):
-                builder.add_paragraph(str(ai_entry.get("description")))
+            description = str(ai_entry.get("description", "")).strip()
+            if not description:
+                description = fallback_process_description(process)
+            if description:
+                builder.add_paragraph(description)
 
             key_activities = ai_entry.get("key_activities", []) if isinstance(ai_entry.get("key_activities"), list) else []
+            if not key_activities:
+                key_activities = [
+                    str(child.get("name", "")).strip()
+                    for child in parser.extract_child_properties(process.get("element"))
+                    if str(child.get("name", "")).strip()
+                    and str(child.get("tag", "")).strip().lower() not in {"startevent", "endevent", "extensionelements"}
+                ][:6]
             if key_activities:
                 builder.add_table(["Key Activity"], [[str(activity)] for activity in key_activities])
 
             steps = ai_entry.get("steps", []) if isinstance(ai_entry.get("steps"), list) else []
+            if not steps:
+                steps = fallback_process_steps(process.get("element"))
             if steps:
                 builder.add_table(["Step", "Description"], [[str(i + 1), str(step)] for i, step in enumerate(steps)])
 
@@ -1046,50 +1610,92 @@ def build_specification_document(
 
             components = parser.extract_components_from_process(process_elem)
             if components:
-                builder.add_table(["Component Name", "Key", "Value"], components)
+                component_rows = filter_display_rows([[key, value] for _, key, value in components if key or value])
+                if component_rows:
+                    builder.add_table(["Key", "Value"], component_rows)
 
             child_props = parser.extract_child_properties(process_elem)
             for child in child_props:
                 child_heading = child.get("heading", "").strip()
+                child_tag = str(child.get("tag", "")).strip().lower()
+                child_activity = str(child.get("activity_type", "")).strip().lower()
                 props = child.get("properties", [])
+                if child_tag in {"startevent", "endevent"}:
+                    continue
+                if child_activity in {"mapping", "script"}:
+                    continue
+                props = filter_display_rows(props)
                 if child_heading and props:
                     builder.add_heading(f"{child_heading} Properties", 4)
                     builder.add_table(["Key", "Value"], props)
 
-    main_processes = all_processes[:1]
-    local_processes = all_processes[1:]
     render_process_block(main_processes, "5.1 Main Integration Process")
-    render_process_block(local_processes, "5.2 Local Integration Process")
+    if local_processes:
+        render_process_block(local_processes, "5.2 Local Integration Process", local_process_diagrams)
 
     # Sender
     builder.add_heading("5.3 Sender", 2)
+    if 'sender' in diagram_bytes:
+        builder.add_image(diagram_bytes['sender'], width=5.2, caption="Sender Configuration")
     sender_ai = get_dict("sender_details")
-    if sender_ai:
-        builder.add_table(["Attribute", "Value"], dict_to_rows(sender_ai))
-    if sender_props:
-        builder.add_table(["Key", "Value"], sender_props)
+    sender_description = str(sender_ai.get("description", "")).strip() if sender_ai else ""
+    if not sender_description:
+        sender_description = build_adapter_description(sender_prop_map, "sender")
+    if sender_description:
+        builder.add_paragraph(sender_description)
+    sender_summary_rows = build_adapter_summary_rows(sender_prop_map, "sender")
+    if sender_summary_rows:
+        builder.add_table(["Attribute", "Value"], sender_summary_rows)
     else:
         builder.add_paragraph("No sender configuration found.", italic=True)
 
     # Receiver
     builder.add_heading("5.4 Receiver", 2)
+    if 'receiver' in diagram_bytes:
+        builder.add_image(diagram_bytes['receiver'], width=5.2, caption="Receiver Configuration")
     receiver_ai = get_dict("receiver_details")
-    if receiver_ai:
-        builder.add_table(["Attribute", "Value"], dict_to_rows(receiver_ai))
-    if receiver_props:
-        builder.add_table(["Key", "Value"], receiver_props)
+    receiver_description = str(receiver_ai.get("description", "")).strip() if receiver_ai else ""
+    if not receiver_description:
+        receiver_description = build_adapter_description(receiver_prop_map, "receiver")
+    if receiver_description:
+        builder.add_paragraph(receiver_description)
+    receiver_summary_rows = build_adapter_summary_rows(receiver_prop_map, "receiver")
+    if receiver_summary_rows:
+        builder.add_table(["Attribute", "Value"], receiver_summary_rows)
     else:
         builder.add_paragraph("No receiver configuration found.", italic=True)
 
     # Mappings
     builder.add_heading("5.5 Mappings", 2)
-    mapping_ai = get_dict("mapping_details")
-    if mapping_ai:
-        builder.add_table(["Attribute", "Value"], dict_to_rows(mapping_ai))
+    mapping_files_by_name: Dict[str, str] = {}
+    for rel_path in list_artifact_paths([".xsl", ".xslt", ".mmap"]):
+        mapping_files_by_name[Path(rel_path).stem.lower()] = rel_path
+
     if mapping_props:
         for idx, mapping in enumerate(mapping_props, start=1):
-            builder.add_heading(f"Mapping Activity {idx} Properties", 3)
-            builder.add_table(["Key", "Value"], mapping)
+            mapping_map = props_to_map(mapping)
+            mapping_name = (
+                mapping_map.get("mappingname")
+                or Path(mapping_map.get("mappinguri", "")).stem
+                or Path(mapping_map.get("mappingpath", "")).stem
+                or f"Mapping {idx}"
+            )
+            mapping_file = (
+                mapping_files_by_name.get(str(mapping_name).lower())
+                or mapping_map.get("mappinguri")
+                or mapping_map.get("mappingpath")
+                or "Not found in project artifacts"
+            )
+            builder.add_heading(str(mapping_name), 3, collapsed=True)
+            for summary_line in build_mapping_summary(str(mapping_name), str(mapping_file)):
+                builder.add_paragraph(summary_line)
+            source_object, target_object = extract_mapping_relation(str(mapping_name), str(mapping_file))
+            mapping_relation_rows = [
+                ["Source Message / Object", source_object],
+                ["Target Message / Object", target_object],
+                ["Mapping File", str(mapping_file)],
+            ]
+            builder.add_table(["Attribute", "Value"], mapping_relation_rows)
     else:
         builder.add_paragraph("No mapping activities found in this integration flow.", italic=True)
 
@@ -1099,7 +1705,11 @@ def build_specification_document(
     if security_ai:
         builder.add_table(["Security Aspect", "Details"], dict_to_rows(security_ai))
     if security_props:
-        builder.add_table(["Key", "Value"], security_props)
+        filtered_security_rows = filter_display_rows(security_props)
+        if filtered_security_rows:
+            builder.add_table(["Key", "Value"], filtered_security_rows)
+        elif not security_ai:
+            builder.add_paragraph("No explicit security properties found.", italic=True)
     else:
         builder.add_paragraph("No explicit security properties found.", italic=True)
 
@@ -1109,32 +1719,34 @@ def build_specification_document(
     if groovy_ai.get("overview"):
         builder.add_paragraph(str(groovy_ai.get("overview")))
 
+    groovy_summaries: Dict[str, Dict[str, Any]] = {}
+    groovy_entries = groovy_ai.get("scripts", []) if isinstance(groovy_ai.get("scripts"), list) else []
+    for entry in groovy_entries:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("name", "")).strip().lower()
+        if key:
+            groovy_summaries[key] = entry
+
     if groovy_scripts:
         for idx, script in enumerate(groovy_scripts, start=1):
             script_name = str(script.get("file_name") or script.get("name") or f"Script {idx}")
             content = str(script.get("content", "") or "")
-            builder.add_heading(f"Script: {script_name}", 3, collapsed=True)
+            builder.add_heading(script_name, 3, collapsed=True)
 
-            script_meta_rows = dict_to_rows({
-                "line_count": script.get("line_count", ""),
-                "imports": script.get("imports", []),
-                "file_path": script.get("file_path", ""),
-            })
-            if script_meta_rows:
-                builder.add_table(["Key", "Value"], script_meta_rows)
+            summary_entry = groovy_summaries.get(script_name.lower(), {})
+            summary_text = str(summary_entry.get("purpose", "")).strip()
+            if not summary_text:
+                function_count = len(script.get("functions", [])) if isinstance(script.get("functions"), list) else 0
+                imports = script.get("imports", []) if isinstance(script.get("imports"), list) else []
+                summary_parts = [f"{script_name} is used within the integration flow."]
+                if function_count:
+                    summary_parts.append(f"It contains {function_count} function(s).")
+                if imports:
+                    summary_parts.append(f"It imports {len(imports)} module(s).")
+                summary_text = " ".join(summary_parts)
+            builder.add_paragraph(summary_text)
 
-            functions = script.get("functions", []) if isinstance(script.get("functions"), list) else []
-            if functions:
-                fn_rows = []
-                for fn in functions:
-                    fn_rows.append([
-                        str(fn.get("name", "")),
-                        str(fn.get("parameters", "")),
-                        str(fn.get("documentation", ""))[:200],
-                    ])
-                builder.add_table(["Function", "Parameters", "Documentation"], fn_rows)
-
-            builder.add_heading("Code", 4, collapsed=True)
             if content.strip():
                 builder.add_code_block(content, "Groovy", max_lines=None)
             else:
@@ -1159,15 +1771,17 @@ def build_specification_document(
     if exception_props:
         for idx, exc in enumerate(exception_props, start=1):
             builder.add_heading(f"Exception SubProcess {idx} Properties", 3)
-            sub_rows = exc.get("subproc_props", [])
+            sub_rows = filter_display_rows(exc.get("subproc_props", []))
             if sub_rows:
                 builder.add_table(["Key", "Value"], sub_rows)
 
             for child in exc.get("children", []):
+                child_rows = filter_display_rows(child.get("props", []))
+                if not child_rows:
+                    continue
                 child_title = f"Child Element: {child.get('tag', '')} {child.get('name', '')}".strip()
                 builder.add_heading(child_title, 4)
-                if child.get("props"):
-                    builder.add_table(["Key", "Value"], child.get("props"))
+                builder.add_table(["Key", "Value"], child_rows)
     else:
         builder.add_paragraph("No exception subprocess configuration found.", italic=True)
 
@@ -1216,28 +1830,26 @@ def build_specification_document(
         builder.add_table(["File", "Namespace", "Elements", "Complex Types"], schema_rows)
 
     if parameters:
-        builder.add_heading("7.3 Runtime Parameters", 2)
-        param_rows = [[str(k), str(v)] for k, v in parameters.items()]
-        builder.add_table(["Parameter", "Value"], param_rows)
-
-    if parameter_definitions:
-        builder.add_heading("7.4 Parameter Definitions", 2)
-        def_rows = [[str(k), str(v)] for k, v in parameter_definitions.items()]
-        builder.add_table(["Parameter", "Definition"], def_rows)
+        builder.add_heading("7.3 Externalized Parameters", 2)
+        param_rows = build_parameter_usage_rows(parameters)
+        if param_rows:
+            builder.add_table(["Parameter", "Value", "Used In"], param_rows)
+        else:
+            builder.add_paragraph("No externalized parameters found.", italic=True)
 
     if is_extended_scope:
         glossary = appendix.get("glossary", []) if isinstance(appendix.get("glossary"), list) else []
         if glossary:
-            builder.add_heading("7.5 Glossary", 2)
+            builder.add_heading("7.4 Glossary", 2)
             builder.add_bullet_list([str(item) for item in glossary])
 
         references = appendix.get("references", "")
         if references:
-            builder.add_heading("7.6 References", 2)
+            builder.add_heading("7.5 References", 2)
             builder.add_paragraph(str(references))
 
         if ai_stats:
-            builder.add_heading("7.7 Generation Statistics", 2)
+            builder.add_heading("7.6 Generation Statistics", 2)
             stat_rows = [
                 ["API Calls", str(ai_stats.get("api_calls", 0))],
                 ["Batch Calls", str(ai_stats.get("batch_calls", 0))],
@@ -1248,12 +1860,12 @@ def build_specification_document(
             builder.add_table(["Statistic", "Value"], stat_rows)
 
         if file_type_summary:
-            builder.add_heading("7.8 File Type Summary", 2)
+            builder.add_heading("7.7 File Type Summary", 2)
             type_rows = [[str(ext), str(count)] for ext, count in file_type_summary.items()]
             builder.add_table(["File Type", "Count"], type_rows)
 
         if all_files:
-            builder.add_heading("7.9 File Inventory", 2)
+            builder.add_heading("7.8 File Inventory", 2)
             inventory_rows: List[List[str]] = []
             max_inventory_rows = 160
             sorted_files = sorted(
@@ -1278,7 +1890,7 @@ def build_specification_document(
                 )
 
         if artifact_coverage or text_artifacts:
-            builder.add_heading("7.10 Artifact Evidence", 2)
+            builder.add_heading("7.9 Artifact Evidence", 2)
 
             if artifact_coverage:
                 builder.add_table(
