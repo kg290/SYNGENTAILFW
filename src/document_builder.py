@@ -673,7 +673,19 @@ class EnterpriseDocumentBuilder:
             filename = f"{safe_name}_TechSpec.docx"
         
         output_path = self.output_dir / filename
-        self.doc.save(str(output_path))
+        try:
+            self.doc.save(str(output_path))
+        except PermissionError:
+            fallback_path = output_path.with_name(
+                f"{output_path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{output_path.suffix}"
+            )
+            logger.warning(
+                "Could not overwrite %s; saving unlocked copy to %s",
+                output_path,
+                fallback_path,
+            )
+            self.doc.save(str(fallback_path))
+            output_path = fallback_path
         logger.info(f"Document saved: {output_path}")
         return output_path
 
@@ -708,11 +720,13 @@ def build_specification_document(
     is_extended_scope = scope_mode == "extended"
 
     iflow_name = parser.iflow_name
-    all_processes = parser.get_integration_processes()
-    main_processes = all_processes[:1]
-    # Only additional top-level BPMN processes are treated as local integration processes.
-    # Exception subprocesses stay in the dedicated error-handling section.
-    local_processes = all_processes[1:]
+    if hasattr(parser, "classify_integration_processes"):
+        main_processes, local_processes = parser.classify_integration_processes()
+        all_processes = main_processes + local_processes
+    else:
+        all_processes = parser.get_integration_processes()
+        main_processes = all_processes[:1]
+        local_processes = all_processes[1:]
     message_flows = parser.extract_message_flows_with_names()
     sequence_flows = parser.extract_sequence_flows_with_names()
     sender_props = parser.extract_sender_properties()
@@ -1009,6 +1023,75 @@ def build_specification_document(
                 continue
             filtered.append([key_text, value_text])
         return filtered
+
+    def filter_detailed_property_rows(
+        rows: List[List[str]],
+        redundant_keys: Optional[set[str]] = None,
+    ) -> List[List[str]]:
+        """Keep detailed adapter/config values without the noisiest internal XML blocks."""
+        detailed_rows: List[List[str]] = []
+        seen: set[Tuple[str, str]] = set()
+        skip_keys = {
+            "headertable",
+            "propertytable",
+            "cmdvarianturi",
+            "name",
+            "direction",
+            "componenttype",
+            "transportprotocolversion",
+            "messageprotocolversion",
+        }
+        if redundant_keys:
+            skip_keys.update(redundant_keys)
+
+        for key, value in rows:
+            key_text = str(key or "").strip()
+            value_text = builder._resolve_runtime_placeholders(str(value or "")).strip()
+            if not key_text or not value_text:
+                continue
+
+            normalized_key = builder._normalize_lookup_key(key_text)
+            if normalized_key in skip_keys:
+                continue
+            if "<row>" in value_text and "<cell" in value_text:
+                continue
+
+            dedupe_key = (normalized_key, value_text)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            detailed_rows.append([key_text, value_text])
+
+        return detailed_rows
+
+    def filter_component_rows(rows: List[List[str]]) -> List[List[str]]:
+        """Render process-level properties with their component/process name."""
+        component_rows: List[List[str]] = []
+        seen: set[Tuple[str, str, str]] = set()
+        for component, key, value in rows:
+            component_text = str(component or "").strip()
+            key_text = str(key or "").strip()
+            value_text = builder._resolve_runtime_placeholders(str(value or "")).strip()
+            if not component_text or not key_text or not value_text:
+                continue
+            if builder._normalize_lookup_key(key_text) in {
+                "headertable",
+                "propertytable",
+                "cmdvarianturi",
+            }:
+                continue
+            if "<row>" in value_text and "<cell" in value_text:
+                continue
+            dedupe_key = (
+                component_text.lower(),
+                builder._normalize_lookup_key(key_text),
+                value_text,
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            component_rows.append([component_text, key_text, value_text])
+        return component_rows
 
     def fallback_process_description(process: Dict[str, Any]) -> str:
         process_elem = process.get("element")
@@ -1533,14 +1616,14 @@ def build_specification_document(
     if message_flows:
         builder.add_heading("4.2 Message Flow Connections", 2)
         builder.add_table(
-            ["Connection", "Name"],
-            [[f"{src} -> {tgt}", name] for src, tgt, name in message_flows],
+            ["Source", "Target", "Name"],
+            [[src, tgt, name] for src, tgt, name in message_flows],
         )
     elif sequence_flows:
         builder.add_heading("4.2 Sequence Flow Connections", 2)
         builder.add_table(
-            ["Connection", "Label"],
-            [[f"{src} -> {tgt}", name] for src, tgt, name in sequence_flows],
+            ["Source", "Target", "Label"],
+            [[src, tgt, name] for src, tgt, name in sequence_flows],
         )
 
     if 'integration_flow' in diagram_bytes:
@@ -1610,9 +1693,9 @@ def build_specification_document(
 
             components = parser.extract_components_from_process(process_elem)
             if components:
-                component_rows = filter_display_rows([[key, value] for _, key, value in components if key or value])
+                component_rows = filter_component_rows(components)
                 if component_rows:
-                    builder.add_table(["Key", "Value"], component_rows)
+                    builder.add_table(["Component Name", "Key", "Value"], component_rows)
 
             child_props = parser.extract_child_properties(process_elem)
             for child in child_props:
@@ -1644,9 +1727,22 @@ def build_specification_document(
     if sender_description:
         builder.add_paragraph(sender_description)
     sender_summary_rows = build_adapter_summary_rows(sender_prop_map, "sender")
+    sender_detail_rows = filter_detailed_property_rows(sender_props, redundant_keys={
+        "address",
+        "urlpath",
+        "addressinbound",
+        "transportprotocol",
+        "messageprotocol",
+        "senderauthtype",
+        "authorization",
+        "authentication",
+        "userrole",
+    })
     if sender_summary_rows:
         builder.add_table(["Attribute", "Value"], sender_summary_rows)
-    else:
+    if sender_detail_rows:
+        builder.add_table(["Key", "Value"], sender_detail_rows, caption="Detailed Sender Adapter Properties")
+    if not sender_summary_rows and not sender_detail_rows:
         builder.add_paragraph("No sender configuration found.", italic=True)
 
     # Receiver
@@ -1660,9 +1756,28 @@ def build_specification_document(
     if receiver_description:
         builder.add_paragraph(receiver_description)
     receiver_summary_rows = build_adapter_summary_rows(receiver_prop_map, "receiver")
+    receiver_detail_rows = filter_detailed_property_rows(receiver_props, redundant_keys={
+        "address",
+        "soapwsdlurl",
+        "url",
+        "urlpath",
+        "host",
+        "alias",
+        "authentication",
+        "credentialname",
+        "usernametokencredentialname",
+        "accesskey",
+        "secretkey",
+        "operationname",
+        "operation",
+        "soapservicename",
+        "s3receiveroperation",
+    })
     if receiver_summary_rows:
         builder.add_table(["Attribute", "Value"], receiver_summary_rows)
-    else:
+    if receiver_detail_rows:
+        builder.add_table(["Key", "Value"], receiver_detail_rows, caption="Detailed Receiver Adapter Properties")
+    if not receiver_summary_rows and not receiver_detail_rows:
         builder.add_paragraph("No receiver configuration found.", italic=True)
 
     # Mappings
@@ -1672,6 +1787,30 @@ def build_specification_document(
         mapping_files_by_name[Path(rel_path).stem.lower()] = rel_path
 
     if mapping_props:
+        mapping_summary_rows: List[List[str]] = []
+        for idx, mapping in enumerate(mapping_props, start=1):
+            mapping_map = props_to_map(mapping)
+            mapping_name = (
+                mapping_map.get("mappingname")
+                or Path(mapping_map.get("mappinguri", "")).stem
+                or Path(mapping_map.get("mappingpath", "")).stem
+                or f"Mapping {idx}"
+            )
+            mapping_file = (
+                mapping_files_by_name.get(str(mapping_name).lower())
+                or mapping_map.get("mappinguri")
+                or mapping_map.get("mappingpath")
+                or "Not found in project artifacts"
+            )
+            mapping_summary_rows.append([
+                str(mapping_name),
+                "\n".join(build_mapping_summary(str(mapping_name), str(mapping_file))),
+                str(mapping_file),
+            ])
+
+        if mapping_summary_rows:
+            builder.add_table(["Name", "2-Line Summary", "Mapping File Link"], mapping_summary_rows)
+
         for idx, mapping in enumerate(mapping_props, start=1):
             mapping_map = props_to_map(mapping)
             mapping_name = (
@@ -1687,13 +1826,10 @@ def build_specification_document(
                 or "Not found in project artifacts"
             )
             builder.add_heading(str(mapping_name), 3, collapsed=True)
-            for summary_line in build_mapping_summary(str(mapping_name), str(mapping_file)):
-                builder.add_paragraph(summary_line)
             source_object, target_object = extract_mapping_relation(str(mapping_name), str(mapping_file))
             mapping_relation_rows = [
                 ["Source Message / Object", source_object],
                 ["Target Message / Object", target_object],
-                ["Mapping File", str(mapping_file)],
             ]
             builder.add_table(["Attribute", "Value"], mapping_relation_rows)
     else:
@@ -1765,7 +1901,7 @@ def build_specification_document(
         builder.add_image(
             diagram_bytes['exception_subprocess'],
             width=5.4,
-            caption="Exception SubProcess (Copied from Integration Flow Diagram)",
+            caption="Exception SubProcess Diagram",
         )
 
     if exception_props:

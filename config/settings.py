@@ -15,6 +15,26 @@ TEMP_DIR = BASE_DIR / "temp"
 OUTPUT_DIR.mkdir(exist_ok=True)
 TEMP_DIR.mkdir(exist_ok=True)
 
+CONFIG_WARNINGS: list[str] = []
+
+
+def _get_int_env(name: str, default: int, minimum: int | None = None) -> int:
+    """Read integer environment variables without failing during module import."""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        value = default
+    else:
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            CONFIG_WARNINGS.append(f"{name} must be an integer; using default {default}.")
+            value = default
+
+    if minimum is not None and value < minimum:
+        CONFIG_WARNINGS.append(f"{name} must be >= {minimum}; using default {default}.")
+        value = default
+    return value
+
 # AI Configuration
 AI_MODEL = os.getenv("AI_MODEL", "gemini-2.0-flash")
 AI_MODEL_THINKING = os.getenv("AI_MODEL_THINKING", "gemini-2.0-flash-thinking-exp-01-21")
@@ -33,10 +53,10 @@ DOC_VERSION = os.getenv("DOC_VERSION", "1.0")
 TECH_SPEC_SCOPE_MODE = os.getenv("TECH_SPEC_SCOPE_MODE", "strict").strip().lower()
 
 # AI settings
-AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "3"))
-AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "60"))
-AI_SENTENCE_LIMIT = int(os.getenv("AI_SENTENCE_LIMIT", "5"))
-FUNCTIONAL_SPEC_MAX_CHARS = int(os.getenv("FUNCTIONAL_SPEC_MAX_CHARS", "15000"))
+AI_MAX_RETRIES = _get_int_env("AI_MAX_RETRIES", 3, minimum=1)
+AI_TIMEOUT_SECONDS = _get_int_env("AI_TIMEOUT_SECONDS", 60, minimum=1)
+AI_SENTENCE_LIMIT = _get_int_env("AI_SENTENCE_LIMIT", 5, minimum=1)
+FUNCTIONAL_SPEC_MAX_CHARS = _get_int_env("FUNCTIONAL_SPEC_MAX_CHARS", 15000, minimum=0)
 
 
 def validate_config() -> tuple[bool, list[str]]:
@@ -53,6 +73,8 @@ def validate_config() -> tuple[bool, list[str]]:
         errors.append(
             "TECH_SPEC_SCOPE_MODE must be either 'strict' or 'extended'."
         )
+
+    errors.extend(CONFIG_WARNINGS)
     
     if not OUTPUT_DIR.exists():
         try:

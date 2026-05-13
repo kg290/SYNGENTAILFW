@@ -194,7 +194,10 @@ def discover_artifacts(
 ) -> tuple[dict[str, list[Path]], Path | None, ZipHandler | None]:
     """Discover artifacts and return (artifacts, iflow_path, zip_handler_if_used)."""
     def collect_all_files(root: Path) -> list[Path]:
-        return [path for path in root.rglob("*") if path.is_file()]
+        return sorted(
+            [path for path in root.rglob("*") if path.is_file()],
+            key=lambda path: str(path).lower(),
+        )
 
     zip_handler: ZipHandler | None = None
 

@@ -38,15 +38,17 @@ class BPMNDiagramGenerator:
     LIGHT_GRAY = '#F5F5F5'
     WHITE = '#FFFFFF'
 
-    # SAP CPI-like styling tokens used by the BPMN-DI renderer.
-    SAP_TASK_FILL = '#EAF5FF'
-    SAP_TASK_EDGE = '#87B1D8'
-    SAP_TEXT = '#2F4D69'
-    SAP_POOL_BG = '#F8FAFC'
-    SAP_POOL_EDGE = '#C1CAD4'
-    SAP_LANE_BG = '#EFF3F7'
-    SAP_SEQ_FLOW = '#6087AD'
-    SAP_MSG_FLOW = '#92A8BD'
+    # SAP CPI-like styling tokens used by the process-flow renderer.
+    SAP_TASK_FILL = '#EAF8FC'
+    SAP_TASK_EDGE = '#9AD8E4'
+    SAP_TEXT = '#303A42'
+    SAP_POOL_BG = '#FFFFFF'
+    SAP_POOL_EDGE = '#C2CAD0'
+    SAP_HEADER_EDGE = '#D8DEE2'
+    SAP_EVENT_EDGE = '#AEBBC3'
+    SAP_GATEWAY_EDGE = '#C4CDD3'
+    SAP_SEQ_FLOW = '#5F8DA5'
+    SAP_MSG_FLOW = '#8DA8BA'
 
     BPMN_NS = {
         'bpmn2': 'http://www.omg.org/spec/BPMN/20100524/MODEL',
@@ -67,13 +69,64 @@ class BPMNDiagramGenerator:
         return value if len(value) <= max_len else f"{value[:max_len - 3]}..."
 
     def _wrap_label(self, value: str, width: int = 14, max_lines: int = 2) -> str:
-        """Wrap labels into at most two lines for task boxes."""
-        trimmed = self._truncate_label(value, max_len=(width * max_lines) + 3)
-        lines = textwrap.wrap(trimmed, width=width) or [trimmed]
+        """Wrap labels for boxes without cutting normal technical names too early."""
+        rendered = str(value or "").strip()
+        lines = textwrap.wrap(rendered, width=width, break_long_words=True, break_on_hyphens=False) or [rendered]
         if len(lines) > max_lines:
-            lines = lines[:max_lines]
-            lines[-1] = self._truncate_label(lines[-1], max_len=width)
+            kept = lines[:max_lines]
+            remaining = " ".join(lines[max_lines - 1:])
+            kept[-1] = self._truncate_label(remaining, max_len=max(width, 18))
+            lines = kept
         return "\n".join(lines)
+
+    @staticmethod
+    def _is_gateway_like(node_name: str, node_type: str = '') -> bool:
+        """Identify routing/check nodes without depending on sample-specific names."""
+        lowered_name = str(node_name or '').lower()
+        lowered_type = str(node_type or '').lower()
+        return 'gateway' in lowered_type or any(
+            token in lowered_name for token in ['router', 'gateway', 'condition']
+        )
+
+    def _extract_ifl_property_map(self, elem: ET.Element) -> Dict[str, str]:
+        """Extract SAP CPI extension properties from a BPMN element."""
+        props: Dict[str, str] = {}
+        for prop in elem.iter():
+            if self._local_name(prop.tag).lower() != 'property':
+                continue
+            key = prop.findtext('key')
+            value = prop.findtext('value')
+            lookup = self._normalize_lookup_key(key or '')
+            if lookup and value is not None:
+                props[lookup] = str(value).strip()
+        return props
+
+    def _activity_visual_kind(self, node_name: str, node_type: str, props: Dict[str, str]) -> str:
+        """Classify activity visuals for the local-process legend."""
+        searchable = " ".join(
+            [
+                str(node_name or ''),
+                str(node_type or ''),
+                *[str(value or '') for value in props.values()],
+            ]
+        ).lower()
+        if any(token in searchable for token in ['mapping', 'message mapping', 'xslt', '.mmap']):
+            return 'mapping'
+        if any(token in searchable for token in ['script', 'groovy', 'javascript', '.gsh', '.groovy']):
+            return 'script'
+        if any(token in searchable for token in ['enricher', 'content enricher']):
+            return 'enricher'
+        return 'task'
+
+    def _activity_style(self, kind: str) -> Tuple[str, str]:
+        """Return fill and edge colors for a local-process activity kind."""
+        styles = {
+            'mapping': ('#F2FFF4', '#71B77B'),
+            'script': ('#FFF8EA', '#F1B64C'),
+            'enricher': ('#F6F0FF', '#9A75D8'),
+            'task': (self.SAP_TASK_FILL, self.SAP_TASK_EDGE),
+        }
+        return styles.get(kind, styles['task'])
 
     def _order_nodes(self, sequence_flows: List[Tuple[str, str, str]], nodes: List[str]) -> List[str]:
         """Use topological ordering when possible to produce a readable left-to-right flow."""
@@ -164,29 +217,131 @@ class BPMNDiagramGenerator:
         )
 
     @staticmethod
-    def _draw_task_corner_icon(ax, x: float, y: float):
-        """Draw a tiny document-like glyph in task corner."""
-        icon_w = 4.4
-        icon_h = 4.0
-        left = x + 3.0
-        top = y + 3.0
-        icon = Rectangle(
-            (left, top),
-            icon_w,
-            icon_h,
-            facecolor='#FFFFFF',
-            edgecolor='#8EAED0',
-            linewidth=0.6,
+    def _draw_task_corner_icon(ax, x: float, y: float, scale: float = 1.0):
+        """Draw a tiny SAP CPI-style activity glyph in the task corner."""
+        left = x + (3.0 * scale)
+        top = y + (3.0 * scale)
+        shadow = Rectangle(
+            (left + (1.1 * scale), top + (1.1 * scale)),
+            3.8 * scale,
+            3.5 * scale,
+            facecolor='#DCEBFA',
+            edgecolor='#8EB6D6',
+            linewidth=0.45,
             zorder=8,
         )
-        ax.add_patch(icon)
-        ax.plot(
-            [left + icon_w * 0.68, left + icon_w * 0.95, left + icon_w * 0.95],
-            [top, top, top + icon_h * 0.28],
-            color='#8EAED0',
-            linewidth=0.55,
+        ax.add_patch(shadow)
+        badge = Rectangle(
+            (left, top),
+            3.7 * scale,
+            3.5 * scale,
+            facecolor='#F5D568',
+            edgecolor='#D7B84D',
+            linewidth=0.45,
             zorder=9,
         )
+        ax.add_patch(badge)
+        ax.add_patch(Circle(
+            (left + (2.0 * scale), top + (1.8 * scale)),
+            radius=0.8 * scale,
+            facecolor='#7EA7C4',
+            edgecolor='none',
+            zorder=10,
+        ))
+
+    @staticmethod
+    def _draw_process_header_icon(ax, x: float, y: float, size: float = 3.1):
+        """Draw the small multi-color process icon in the container header."""
+        colors = ['#77AADB', '#F1C84B', '#87B966', '#C7D6E4']
+        offsets = [(0, 0), (size * 0.9, 0), (0, size * 0.9), (size * 0.9, size * 0.9)]
+        for (dx, dy), color in zip(offsets, colors):
+            ax.add_patch(Rectangle(
+                (x + dx, y + dy),
+                size,
+                size,
+                facecolor=color,
+                edgecolor='#8B9BA8',
+                linewidth=0.35,
+                zorder=6,
+            ))
+
+    def _draw_process_container(
+        self,
+        ax,
+        left: float,
+        top: float,
+        right: float,
+        bottom: float,
+        title: str,
+        header_h: float,
+    ) -> None:
+        """Draw the SAP CPI process frame with a title/header strip."""
+        width = right - left
+        height = bottom - top
+        outer = Rectangle(
+            (left, top),
+            width,
+            height,
+            facecolor=self.SAP_POOL_BG,
+            edgecolor=self.SAP_POOL_EDGE,
+            linewidth=0.85,
+            zorder=0,
+        )
+        ax.add_patch(outer)
+        ax.plot(
+            [left, right],
+            [top + header_h, top + header_h],
+            color=self.SAP_HEADER_EDGE,
+            linewidth=0.8,
+            zorder=1,
+        )
+        icon_size = max(1.05, min(3.1, header_h * 0.14))
+        icon_y = top + (header_h / 2.0) - (icon_size * 0.95)
+        self._draw_process_header_icon(ax, left + 8.0, icon_y, size=icon_size)
+        ax.text(
+            left + (width / 2.0),
+            top + (header_h / 2.0),
+            self._truncate_label(title.replace('_', ' '), max_len=64),
+            ha='center',
+            va='center',
+            fontsize=7.8,
+            color='#2E3942',
+            zorder=6,
+        )
+
+    def _draw_local_process_legend(self, ax, left: float, bottom: float) -> None:
+        """Draw a compact CPI legend for standalone local-process diagrams."""
+        y = bottom - 7.0
+        x = left + 10.0
+        text_color = '#4D5962'
+        mapping_fill, mapping_edge = self._activity_style('mapping')
+        script_fill, script_edge = self._activity_style('script')
+        enricher_fill, enricher_edge = self._activity_style('enricher')
+        task_fill, task_edge = self._activity_style('task')
+        items = [
+            ('event', 'Start / End', '#FFFFFF', self.SAP_EVENT_EDGE),
+            ('box', 'Mapping', mapping_fill, mapping_edge),
+            ('box', 'Script', script_fill, script_edge),
+            ('box', 'Enricher', enricher_fill, enricher_edge),
+            ('box', 'Task', task_fill, task_edge),
+        ]
+
+        for kind, label, fill, edge in items:
+            if kind == 'event':
+                ax.add_patch(Circle((x, y), radius=1.2, facecolor=fill, edgecolor=edge, linewidth=0.9, zorder=7))
+            else:
+                ax.add_patch(FancyBboxPatch(
+                    (x - 1.4, y - 1.2),
+                    2.8,
+                    2.4,
+                    boxstyle='round,pad=0.01,rounding_size=0.35',
+                    facecolor=fill,
+                    edgecolor=edge,
+                    linewidth=0.8,
+                    zorder=7,
+                ))
+            ax.text(x + 2.7, y, label, ha='left', va='center', fontsize=5.7, color=text_color, zorder=8)
+            x += 16.0
 
     @staticmethod
     def _draw_gateway_marker(ax, cx: float, cy: float, element_type: str):
@@ -752,6 +907,7 @@ class BPMNDiagramGenerator:
                 format='png',
                 dpi=self.dpi,
                 bbox_inches='tight',
+                pad_inches=0.12,
                 facecolor=self.WHITE,
                 edgecolor='none',
             )
@@ -944,7 +1100,7 @@ class BPMNDiagramGenerator:
             xs,
             ys,
             color=color,
-            linewidth=1.05,
+            linewidth=1.22,
             linestyle='-',
             solid_capstyle='round',
             solid_joinstyle='round',
@@ -955,8 +1111,8 @@ class BPMNDiagramGenerator:
             points[-2],
             points[-1],
             arrowstyle='-|>',
-            mutation_scale=8.8,
-            linewidth=1.05,
+            mutation_scale=10.5,
+            linewidth=1.22,
             color=color,
             zorder=5,
         )
@@ -1031,7 +1187,134 @@ class BPMNDiagramGenerator:
 
         return normalized
 
-    def generate_integration_flow_diagram_from_bpmndi(self, parser) -> Optional[bytes]:
+    def _build_flow_metadata(self, root: ET.Element) -> Dict[str, Dict[str, str]]:
+        """Collect sequence/message flow metadata keyed by BPMN flow id."""
+        flow_meta: Dict[str, Dict[str, str]] = {}
+        for flow in root.findall('.//bpmn2:sequenceFlow', self.BPMN_NS):
+            flow_id = flow.attrib.get('id')
+            if flow_id:
+                flow_meta[flow_id] = {
+                    'type': 'sequence',
+                    'name': flow.attrib.get('name', ''),
+                    'source_ref': flow.attrib.get('sourceRef', ''),
+                    'target_ref': flow.attrib.get('targetRef', ''),
+                }
+        for flow in root.findall('.//bpmn2:messageFlow', self.BPMN_NS):
+            flow_id = flow.attrib.get('id')
+            if flow_id:
+                flow_meta[flow_id] = {
+                    'type': 'message',
+                    'name': flow.attrib.get('name', ''),
+                    'source_ref': flow.attrib.get('sourceRef', ''),
+                    'target_ref': flow.attrib.get('targetRef', ''),
+                }
+        return flow_meta
+
+    @staticmethod
+    def _content_bounds_for_process(
+        shapes: Dict[str, Dict[str, float]],
+        edges: Dict[str, List[Tuple[float, float]]],
+        participants: Dict[str, Dict[str, str]],
+        flow_meta: Dict[str, Dict[str, str]],
+        allowed_node_ids: Optional[set[str]] = None,
+    ) -> Optional[Dict[str, float]]:
+        """Return compact bounds for process nodes and sequence flows only."""
+        all_x: List[float] = []
+        all_y: List[float] = []
+
+        for element_id, bounds in shapes.items():
+            if element_id in participants:
+                continue
+            if allowed_node_ids is not None and element_id not in allowed_node_ids:
+                continue
+            all_x.extend([bounds['x'], bounds['x'] + bounds['w']])
+            all_y.extend([bounds['y'], bounds['y'] + bounds['h']])
+
+        for flow_id, points in edges.items():
+            info = flow_meta.get(flow_id, {})
+            if info.get('type') == 'message':
+                continue
+            if allowed_node_ids is not None:
+                source_id = str(info.get('source_ref', ''))
+                target_id = str(info.get('target_ref', ''))
+                if source_id not in allowed_node_ids or target_id not in allowed_node_ids:
+                    continue
+            if not points:
+                continue
+            all_x.extend([pt[0] for pt in points])
+            all_y.extend([pt[1] for pt in points])
+
+        if not all_x or not all_y:
+            return None
+
+        return {
+            'left': min(all_x),
+            'right': max(all_x),
+            'top': min(all_y),
+            'bottom': max(all_y),
+        }
+
+    def _node_ids_inside_bounds(
+        self,
+        shapes: Dict[str, Dict[str, float]],
+        participants: Dict[str, Dict[str, str]],
+        container_bounds: Optional[Dict[str, float]],
+    ) -> Optional[set[str]]:
+        """Find BPMN node ids whose centers sit inside a process container."""
+        if not container_bounds:
+            return None
+
+        node_ids: set[str] = set()
+        for element_id, bounds in shapes.items():
+            if element_id in participants:
+                continue
+            center_point = (
+                bounds['x'] + (bounds['w'] / 2.0),
+                bounds['y'] + (bounds['h'] / 2.0),
+            )
+            if self._point_inside_bounds(center_point, container_bounds):
+                node_ids.add(element_id)
+
+        return node_ids or None
+
+    @staticmethod
+    def _cpi_canvas_bounds(content_bounds: Dict[str, float]) -> Dict[str, float]:
+        """Add teacher-reference style padding and header space around process content."""
+        content_w = max(content_bounds['right'] - content_bounds['left'], 1.0)
+        content_h = max(content_bounds['bottom'] - content_bounds['top'], 1.0)
+        header_h = max(22.0, min(28.0, content_h * 0.12))
+        pad_x = max(34.0, min(70.0, content_w * 0.06))
+        content_gap_top = max(18.0, min(30.0, content_h * 0.08))
+        pad_bottom = max(30.0, min(48.0, content_h * 0.12))
+
+        return {
+            'left': content_bounds['left'] - pad_x,
+            'right': content_bounds['right'] + pad_x,
+            'top': content_bounds['top'] - header_h - content_gap_top,
+            'bottom': content_bounds['bottom'] + pad_bottom,
+            'header_h': header_h,
+        }
+
+    @staticmethod
+    def _flow_label_position(points: List[Tuple[float, float]]) -> Tuple[float, float, str]:
+        """Place route labels near connectors without colliding with node labels."""
+        if len(points) < 2:
+            return 0.0, 0.0, 'center'
+
+        mid_idx = max(0, (len(points) // 2) - 1)
+        x1, y1 = points[mid_idx]
+        x2, y2 = points[mid_idx + 1]
+        mid_x = (x1 + x2) / 2.0
+        mid_y = (y1 + y2) / 2.0
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+
+        if dy > dx * 0.65:
+            return mid_x + 10.0, mid_y, 'left'
+
+        return mid_x, mid_y - 8.0, 'center'
+
+    def generate_integration_flow_diagram_from_bpmndi(self, parser, process_id: Optional[str] = None) -> Optional[bytes]:
         """Generate BPMN-style diagram directly from BPMN-DI coordinates."""
         try:
             root = parser.get_root()
@@ -1070,25 +1353,7 @@ class BPMNDiagramGenerator:
                 logger.warning("No BPMN-DI shape data found; falling back to legacy layout")
                 return None
 
-            flow_meta: Dict[str, Dict[str, str]] = {}
-            for flow in root.findall('.//bpmn2:sequenceFlow', self.BPMN_NS):
-                flow_id = flow.attrib.get('id')
-                if flow_id:
-                    flow_meta[flow_id] = {
-                        'type': 'sequence',
-                        'name': flow.attrib.get('name', ''),
-                        'source_ref': flow.attrib.get('sourceRef', ''),
-                        'target_ref': flow.attrib.get('targetRef', ''),
-                    }
-            for flow in root.findall('.//bpmn2:messageFlow', self.BPMN_NS):
-                flow_id = flow.attrib.get('id')
-                if flow_id:
-                    flow_meta[flow_id] = {
-                        'type': 'message',
-                        'name': flow.attrib.get('name', ''),
-                        'source_ref': flow.attrib.get('sourceRef', ''),
-                        'target_ref': flow.attrib.get('targetRef', ''),
-                    }
+            flow_meta = self._build_flow_metadata(root)
 
             participant_ids = [pid for pid in participants if pid in shapes]
             participant_ids.sort(
@@ -1098,188 +1363,198 @@ class BPMNDiagramGenerator:
 
             process_pool_bounds: Optional[Dict[str, float]] = None
             process_pool_id: Optional[str] = None
-            for participant_id in participant_ids:
-                info = participants.get(participant_id, {})
-                if info.get('process_ref'):
-                    bounds = shapes[participant_id]
-                    area = bounds['w'] * bounds['h']
-                    if process_pool_bounds is None or area > (process_pool_bounds['w'] * process_pool_bounds['h']):
-                        process_pool_bounds = bounds
-                        process_pool_id = participant_id
-
-            # Move secondary JDBC process cluster left to better match the reference layout.
-            if process_pool_id:
-                secondary_process_id: Optional[str] = None
+            requested_process_id = str(process_id or '').strip()
+            if requested_process_id:
                 for participant_id in participant_ids:
-                    if participant_id == process_pool_id:
-                        continue
-
                     info = participants.get(participant_id, {})
-                    if not info.get('process_ref'):
-                        continue
-
-                    participant_bounds = shapes.get(participant_id)
-                    if not participant_bounds:
-                        continue
-
-                    participant_name = str(info.get('name', '')).lower()
-                    contains_jdbc = 'jdbc' in participant_name
-                    if not contains_jdbc:
-                        for element_id, element_bounds in shapes.items():
-                            if element_id in participants:
-                                continue
-                            center_point = (
-                                element_bounds['x'] + (element_bounds['w'] / 2.0),
-                                element_bounds['y'] + (element_bounds['h'] / 2.0),
-                            )
-                            if not self._point_inside_bounds(center_point, participant_bounds):
-                                continue
-                            node_name = str(element_meta.get(element_id, {}).get('name', '')).lower()
-                            if 'jdbc' in node_name:
-                                contains_jdbc = True
-                                break
-
-                    if contains_jdbc:
-                        secondary_process_id = participant_id
+                    if str(info.get('process_ref', '')).strip() == requested_process_id:
+                        process_pool_bounds = shapes[participant_id]
+                        process_pool_id = participant_id
                         break
 
-                if secondary_process_id:
-                    secondary_bounds = dict(shapes[secondary_process_id])
-                    cluster_ids: List[str] = [secondary_process_id]
-                    for element_id, element_bounds in shapes.items():
-                        if element_id == secondary_process_id:
-                            continue
-                        center_point = (
-                            element_bounds['x'] + (element_bounds['w'] / 2.0),
-                            element_bounds['y'] + (element_bounds['h'] / 2.0),
-                        )
-                        if self._point_inside_bounds(center_point, secondary_bounds):
-                            cluster_ids.append(element_id)
+            if process_pool_bounds is None:
+                for participant_id in participant_ids:
+                    info = participants.get(participant_id, {})
+                    if info.get('process_ref'):
+                        bounds = shapes[participant_id]
+                        area = bounds['w'] * bounds['h']
+                        if process_pool_bounds is None or area > (process_pool_bounds['w'] * process_pool_bounds['h']):
+                            process_pool_bounds = bounds
+                            process_pool_id = participant_id
 
-                    shift_x = -46.0
-                    for element_id in cluster_ids:
-                        if element_id in shapes:
-                            shapes[element_id]['x'] = shapes[element_id]['x'] + shift_x
-
-                    for flow_id, points in list(edges.items()):
-                        if not points:
-                            continue
-
-                        flow_info = flow_meta.get(flow_id, {})
-                        source_id = str(flow_info.get('source_ref', ''))
-                        target_id = str(flow_info.get('target_ref', ''))
-                        source_in_cluster = source_id in cluster_ids
-                        target_in_cluster = target_id in cluster_ids
-
-                        if source_in_cluster and target_in_cluster:
-                            edges[flow_id] = [(x + shift_x, y) for x, y in points]
-                            continue
-
-                        if source_in_cluster and not target_in_cluster:
-                            edges[flow_id] = [
-                                (x + shift_x, y) if idx < (len(points) - 1) else (x, y)
-                                for idx, (x, y) in enumerate(points)
-                            ]
-                            continue
-
-                        if target_in_cluster and not source_in_cluster:
-                            edges[flow_id] = [
-                                (x, y) if idx == 0 else (x + shift_x, y)
-                                for idx, (x, y) in enumerate(points)
-                            ]
-                            continue
-
-                        if any(self._point_inside_bounds(point, secondary_bounds) for point in points):
-                            edges[flow_id] = [
-                                (x + shift_x, y) if self._point_inside_bounds((x, y), secondary_bounds) else (x, y)
-                                for x, y in points
-                            ]
-
-            all_x: List[float] = []
-            all_y: List[float] = []
-            for bounds in shapes.values():
-                all_x.extend([bounds['x'], bounds['x'] + bounds['w']])
-                all_y.extend([bounds['y'], bounds['y'] + bounds['h']])
-            for points in edges.values():
-                all_x.extend([pt[0] for pt in points])
-                all_y.extend([pt[1] for pt in points])
-
-            if not all_x or not all_y:
+            allowed_node_ids = self._node_ids_inside_bounds(shapes, participants, process_pool_bounds)
+            content_bounds = self._content_bounds_for_process(
+                shapes,
+                edges,
+                participants,
+                flow_meta,
+                allowed_node_ids,
+            )
+            if not content_bounds:
                 logger.warning("No drawable BPMN-DI coordinates found")
                 return None
 
-            min_x, max_x = min(all_x), max(all_x)
-            min_y, max_y = min(all_y), max(all_y)
-            diagram_w = max(max_x - min_x, 1.0)
-            diagram_h = max(max_y - min_y, 1.0)
+            canvas = self._cpi_canvas_bounds(content_bounds)
+            canvas_left = canvas['left']
+            canvas_right = canvas['right']
+            canvas_top = canvas['top']
+            canvas_bottom = canvas['bottom']
+            header_h = canvas['header_h']
 
-            fig_w = min(20.0, max(14.0, diagram_w / 95.0))
-            fig_h = min(12.5, max(8.0, diagram_h / 95.0))
+            connected_message_flow_ids: set[str] = set()
+            external_participant_ids: set[str] = set()
+            external_connection_targets: Dict[str, str] = {}
+            for flow_id, info in flow_meta.items():
+                if info.get('type') != 'message':
+                    continue
+
+                source_id = str(info.get('source_ref', ''))
+                target_id = str(info.get('target_ref', ''))
+                source_inside = allowed_node_ids is None or source_id in allowed_node_ids
+                target_inside = allowed_node_ids is None or target_id in allowed_node_ids
+
+                if source_inside and target_id in participants and target_id in shapes:
+                    connected_message_flow_ids.add(flow_id)
+                    external_participant_ids.add(target_id)
+                    external_connection_targets.setdefault(target_id, source_id)
+                elif target_inside and source_id in participants and source_id in shapes:
+                    connected_message_flow_ids.add(flow_id)
+                    external_participant_ids.add(source_id)
+                    external_connection_targets.setdefault(source_id, target_id)
+
+            process_center_x = (canvas_left + canvas_right) / 2.0
+            external_bounds: Dict[str, Dict[str, float]] = {}
+            external_sides: Dict[str, str] = {}
+            external_label_names = [
+                str(flow_meta.get(flow_id, {}).get('name', '')).strip()
+                for flow_id in connected_message_flow_ids
+                if str(flow_meta.get(flow_id, {}).get('name', '')).strip()
+            ]
+            longest_external_label = max((len(name) for name in external_label_names), default=0)
+            external_gap = max(
+                60.0,
+                min(135.0, 18.0 + (longest_external_label * 2.2)),
+                min(95.0, (canvas_right - canvas_left) * 0.10),
+            )
+            for participant_id in external_participant_ids:
+                original = shapes[participant_id]
+                connected_node_id = external_connection_targets.get(participant_id, '')
+                connected_node = shapes.get(connected_node_id)
+                connected_center_y = (
+                    connected_node['y'] + (connected_node['h'] / 2.0)
+                    if connected_node
+                    else content_bounds['top'] + ((content_bounds['bottom'] - content_bounds['top']) / 2.0)
+                )
+
+                w = max(62.0, min(82.0, original['w']))
+                h = max(70.0, min(100.0, original['h']))
+                original_center_x = original['x'] + (original['w'] / 2.0)
+                original_center_y = original['y'] + (original['h'] / 2.0)
+                vertical_margin = max(12.0, min(30.0, process_pool_bounds['h'] * 0.04)) if process_pool_bounds else 18.0
+                side = 'right'
+
+                if process_pool_bounds and original_center_y > process_pool_bounds['y'] + process_pool_bounds['h'] + vertical_margin:
+                    side = 'below'
+                    x = min(
+                        max(connected_node['x'] + (connected_node['w'] / 2.0) - (w / 2.0), canvas_left + 8.0)
+                        if connected_node else original['x'],
+                        canvas_right - w - 8.0,
+                    )
+                    y = canvas_bottom + max(22.0, min(42.0, external_gap * 0.45))
+                elif process_pool_bounds and original_center_y < process_pool_bounds['y'] - vertical_margin:
+                    side = 'above'
+                    x = min(
+                        max(connected_node['x'] + (connected_node['w'] / 2.0) - (w / 2.0), canvas_left + 8.0)
+                        if connected_node else original['x'],
+                        canvas_right - w - 8.0,
+                    )
+                    y = canvas_top - max(22.0, min(42.0, external_gap * 0.45)) - h
+                elif original_center_x < process_center_x:
+                    side = 'left'
+                    x = canvas_left - external_gap - w
+                    y = connected_center_y - (h / 2.0)
+                else:
+                    side = 'right'
+                    x = canvas_right + external_gap
+                    y = connected_center_y - (h / 2.0)
+                external_sides[participant_id] = side
+                external_bounds[participant_id] = {
+                    'x': x,
+                    'y': y,
+                    'w': w,
+                    'h': h,
+                }
+
+            full_left = canvas_left
+            full_right = canvas_right
+            full_top = canvas_top
+            full_bottom = canvas_bottom
+            for bounds in external_bounds.values():
+                full_left = min(full_left, bounds['x'])
+                full_right = max(full_right, bounds['x'] + bounds['w'])
+                full_top = min(full_top, bounds['y'])
+                full_bottom = max(full_bottom, bounds['y'] + bounds['h'])
+
+            diagram_w = max(full_right - full_left, 1.0)
+            diagram_h = max(full_bottom - full_top, 1.0)
+
+            fig_w = min(12.0, max(8.2, diagram_w / 135.0))
+            fig_h = min(8.2, max(4.2, diagram_h / 100.0))
 
             fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h))
             ax.set_facecolor(self.WHITE)
             fig.patch.set_facecolor(self.WHITE)
 
-            pad = max(20.0, min(32.0, max(diagram_w, diagram_h) * 0.03))
-            canvas_left = min_x - pad
-            canvas_right = max_x + pad
-            ax.set_xlim(canvas_left, canvas_right)
-            ax.set_ylim(max_y + pad, min_y - pad)  # inverted y-axis to match BPMN canvas
+            frame_pad = max(8.0, min(20.0, max(diagram_w, diagram_h) * 0.015))
+            ax.set_xlim(full_left - frame_pad, full_right + frame_pad)
+            ax.set_ylim(full_bottom + frame_pad, full_top - frame_pad)  # inverted y-axis to match BPMN canvas
             ax.axis('off')
 
-            # Draw pools/participants first.
-            for participant_id in participant_ids:
+            title = self.iflow_name
+            if process_pool_id:
+                title = str(participants.get(process_pool_id, {}).get('name') or title)
+            self._draw_process_container(
+                ax,
+                canvas_left,
+                canvas_top,
+                canvas_right,
+                canvas_bottom,
+                title,
+                header_h,
+            )
+
+            # Draw sender/receiver participants outside the process frame.
+            for participant_id in sorted(external_participant_ids, key=lambda pid: shapes[pid]['x']):
                 info = participants.get(participant_id, {})
-                bounds = shapes[participant_id]
+                bounds = external_bounds.get(participant_id, shapes[participant_id])
                 x, y, w, h = bounds['x'], bounds['y'], bounds['w'], bounds['h']
-                name = str(info.get('name', participant_id)).replace('_', ' ')
-                is_process_pool = bool(info.get('process_ref')) or w > 300
-
-                if is_process_pool:
-                    pool = Rectangle(
-                        (x, y), w, h,
-                        facecolor=self.SAP_POOL_BG, edgecolor=self.SAP_POOL_EDGE, linewidth=0.92, zorder=1
-                    )
-                    ax.add_patch(pool)
-
-                    lane_w = max(22.0, min(34.0, w * 0.05))
-                    lane_label = Rectangle(
-                        (x, y), lane_w, h,
-                        facecolor=self.SAP_LANE_BG, edgecolor=self.SAP_POOL_EDGE, linewidth=0.88, zorder=2
-                    )
-                    ax.add_patch(lane_label)
-
-                    ax.text(
-                        x + lane_w / 2,
-                        y + h / 2,
-                        self._wrap_label(name, width=14, max_lines=3),
-                        rotation=90,
-                        ha='center',
-                        va='center',
-                        fontsize=7.4,
-                        color='#4D5A66',
-                        zorder=3,
-                    )
-                else:
-                    ext_box = Rectangle(
-                        (x, y), w, h,
-                        facecolor='#FFFFFF', edgecolor='#C5CED8', linewidth=0.85, zorder=2
-                    )
-                    ax.add_patch(ext_box)
-                    ax.text(
-                        x + w / 2,
-                        y + h / 2,
-                        self._wrap_label(name, width=14, max_lines=3),
-                        ha='center',
-                        va='center',
-                        fontsize=7.2,
-                        color='#4C5968',
-                        zorder=3,
-                    )
+                name = str(info.get('name') or participant_id).replace('_', ' ')
+                participant_box = Rectangle(
+                    (x, y),
+                    w,
+                    h,
+                    facecolor='#FFFFFF',
+                    edgecolor='#C7D2DC',
+                    linewidth=0.85,
+                    zorder=2,
+                )
+                ax.add_patch(participant_box)
+                ax.text(
+                    x + (w / 2.0),
+                    y + (h / 2.0),
+                    self._wrap_label(name, width=16, max_lines=3),
+                    ha='center',
+                    va='center',
+                    fontsize=7.2,
+                    color='#4D5962',
+                    zorder=3,
+                )
 
             # Draw BPMN nodes.
             for element_id, bounds in shapes.items():
                 if element_id in participants:
+                    continue
+                if allowed_node_ids is not None and element_id not in allowed_node_ids:
                     continue
 
                 meta = element_meta.get(element_id, {})
@@ -1289,19 +1564,13 @@ class BPMNDiagramGenerator:
                 cx, cy = x + (w / 2), y + (h / 2)
 
                 if 'event' in element_type:
-                    radius = min(w, h) * 0.46
-                    lw = 1.6 if 'endevent' in element_type else 1.1
+                    radius = min(w, h) * 0.42
+                    lw = 2.0 if 'endevent' in element_type else 0.9
                     event = Circle(
                         (cx, cy), radius,
-                        facecolor='#FFFFFF', edgecolor='#5D7F9F', linewidth=lw, zorder=6
+                        facecolor='#FFFFFF', edgecolor=self.SAP_EVENT_EDGE, linewidth=lw, zorder=6
                     )
                     ax.add_patch(event)
-                    if 'endevent' in element_type:
-                        end_inner = Circle((cx, cy), radius * 0.74, facecolor='none', edgecolor='#5D7F9F', linewidth=0.9, zorder=6)
-                        ax.add_patch(end_inner)
-                    elif 'startevent' in element_type:
-                        start_inner = Circle((cx, cy), radius * 0.18, facecolor='#5D7F9F', edgecolor='none', zorder=7)
-                        ax.add_patch(start_inner)
                     ax.text(
                         cx,
                         y + h + 10,
@@ -1309,7 +1578,7 @@ class BPMNDiagramGenerator:
                         ha='center',
                         va='top',
                         fontsize=7.1,
-                        color='#49657F',
+                        color=self.SAP_TEXT,
                         zorder=7,
                     )
                     continue
@@ -1318,18 +1587,17 @@ class BPMNDiagramGenerator:
                     diamond = patches.Polygon(
                         [(cx, y), (x + w, cy), (cx, y + h), (x, cy)],
                         closed=True,
-                        facecolor='#FFFFFF', edgecolor='#6A8CAF', linewidth=1.0, zorder=5
+                        facecolor='#FFFFFF', edgecolor=self.SAP_GATEWAY_EDGE, linewidth=0.85, zorder=5
                     )
                     ax.add_patch(diamond)
-                    self._draw_gateway_marker(ax, cx, cy, element_type)
                     ax.text(
                         cx,
                         y + h + 10,
-                        self._truncate_label(label, 22),
+                        self._wrap_label(label, width=14, max_lines=2),
                         fontsize=6.9,
                         ha='center',
                         va='top',
-                        color='#4A6781',
+                        color=self.SAP_TEXT,
                         zorder=7,
                     )
                     continue
@@ -1337,8 +1605,8 @@ class BPMNDiagramGenerator:
                 if 'subprocess' in element_type:
                     subproc = FancyBboxPatch(
                         (x, y), w, h,
-                        boxstyle='round,pad=0.01,rounding_size=6',
-                        facecolor='#FAFCFE', edgecolor='#B4C3D1', linewidth=0.95, zorder=4
+                        boxstyle='round,pad=0.01,rounding_size=5',
+                        facecolor='#FFFFFF', edgecolor=self.SAP_POOL_EDGE, linewidth=0.8, zorder=2
                     )
                     ax.add_patch(subproc)
                     label_y = y + min(18.0, max(12.0, h * 0.18))
@@ -1349,46 +1617,70 @@ class BPMNDiagramGenerator:
                         ha='center',
                         va='top',
                         fontsize=7.1,
-                        color='#3B556D',
+                        color=self.SAP_TEXT,
                         zorder=6,
                     )
-                    self._draw_collapsed_marker(ax, cx, y + h - 5, w)
                     continue
 
                 # Default task/callActivity/serviceTask style.
-                line_w = 1.25 if 'callactivity' in element_type else 1.0
                 task = FancyBboxPatch(
                     (x, y), w, h,
-                    boxstyle='round,pad=0.01,rounding_size=4.6',
-                    facecolor=self.SAP_TASK_FILL, edgecolor=self.SAP_TASK_EDGE, linewidth=line_w, zorder=5
+                    boxstyle='round,pad=0.01,rounding_size=2.2',
+                    facecolor=self.SAP_TASK_FILL, edgecolor=self.SAP_TASK_EDGE, linewidth=0.85, zorder=5
                 )
                 ax.add_patch(task)
                 self._draw_task_corner_icon(ax, x, y)
 
+                task_label = self._wrap_label(label, width=max(13, int(w / 5.6)), max_lines=5)
+                task_line_count = task_label.count("\n") + 1
+                task_font_size = 7.1 if task_line_count <= 3 else 6.3
                 ax.text(
                     cx,
                     cy,
-                    self._wrap_label(label, width=max(10, int(w / 7)), max_lines=2),
+                    task_label,
                     ha='center',
                     va='center',
-                    fontsize=7.1,
+                    fontsize=task_font_size,
                     color=self.SAP_TEXT,
                     zorder=6,
                 )
-                self._draw_task_activity_marker(ax, cx, y + h - 3.4, w)
-
-                if 'callactivity' in element_type:
-                    self._draw_collapsed_marker(ax, cx, y + h - 5, w)
 
             # Draw sequence and message edges.
             for flow_id, points in edges.items():
                 info = flow_meta.get(flow_id, {'type': 'sequence', 'name': ''})
                 is_message = info.get('type') == 'message'
+                if is_message:
+                    if flow_id not in connected_message_flow_ids:
+                        continue
+                if allowed_node_ids is not None:
+                    source_id = str(info.get('source_ref', ''))
+                    target_id = str(info.get('target_ref', ''))
+                    source_in_scope = source_id in allowed_node_ids or source_id in external_participant_ids
+                    target_in_scope = target_id in allowed_node_ids or target_id in external_participant_ids
+                    if not source_in_scope or not target_in_scope:
+                        continue
                 color = self.SAP_MSG_FLOW if is_message else self.SAP_SEQ_FLOW
 
-                source_bounds = shapes.get(str(info.get('source_ref', '')))
-                target_bounds = shapes.get(str(info.get('target_ref', '')))
-                normalized_points = self._normalize_flow_points(points, source_bounds, target_bounds)
+                source_id = str(info.get('source_ref', ''))
+                target_id = str(info.get('target_ref', ''))
+                source_bounds = external_bounds.get(source_id) or shapes.get(source_id)
+                target_bounds = external_bounds.get(target_id) or shapes.get(target_id)
+
+                if is_message and source_bounds and target_bounds:
+                    source_center = (
+                        source_bounds['x'] + (source_bounds['w'] / 2.0),
+                        source_bounds['y'] + (source_bounds['h'] / 2.0),
+                    )
+                    target_center = (
+                        target_bounds['x'] + (target_bounds['w'] / 2.0),
+                        target_bounds['y'] + (target_bounds['h'] / 2.0),
+                    )
+                    normalized_points = [
+                        self._project_center_to_bounds_edge(source_bounds, target_center),
+                        self._project_center_to_bounds_edge(target_bounds, source_center),
+                    ]
+                else:
+                    normalized_points = self._normalize_flow_points(points, source_bounds, target_bounds)
 
                 if is_message:
                     self._draw_message_flow(ax, normalized_points, color=color)
@@ -1397,19 +1689,36 @@ class BPMNDiagramGenerator:
 
                 flow_name = str(info.get('name', '')).strip()
                 if flow_name:
-                    mid_idx = max(0, (len(normalized_points) // 2) - 1)
-                    x1, y1 = normalized_points[mid_idx]
-                    x2, y2 = normalized_points[mid_idx + 1]
-                    mid_x = (x1 + x2) / 2
-                    mid_y = (y1 + y2) / 2
+                    label_x, label_y, label_ha = self._flow_label_position(normalized_points)
+                    label_va = 'center'
+                    if is_message:
+                        external_label_bounds = external_bounds.get(source_id) or external_bounds.get(target_id)
+                        if external_label_bounds:
+                            side = external_sides.get(source_id) or external_sides.get(target_id) or ''
+                            external_center_x = external_label_bounds['x'] + (external_label_bounds['w'] / 2.0)
+                            if side in {'left', 'right'}:
+                                flow_mid_y = (normalized_points[0][1] + normalized_points[-1][1]) / 2.0
+                                label_y = flow_mid_y - 8.0
+                                if external_center_x < process_center_x:
+                                    label_x = (external_label_bounds['x'] + external_label_bounds['w'] + canvas_left) / 2.0
+                                else:
+                                    label_x = (external_label_bounds['x'] + canvas_right) / 2.0
+                                label_ha = 'center'
+                                label_va = 'bottom'
+                    label_text = (
+                        self._wrap_label(flow_name.replace('_', ' '), width=16, max_lines=3)
+                        if is_message
+                        else self._truncate_label(flow_name, max_len=34)
+                    )
                     ax.text(
-                        mid_x,
-                        mid_y - 10,
-                        self._truncate_label(flow_name, max_len=34),
-                        fontsize=6.8,
-                        color='#5A738B',
-                        ha='center',
-                        va='center',
+                        label_x,
+                        label_y,
+                        label_text,
+                        fontsize=5.7 if is_message else 6.8,
+                        color='#4D5962',
+                        ha=label_ha,
+                        va=label_va,
+                        bbox={'facecolor': self.WHITE, 'edgecolor': 'none', 'pad': 0.25, 'alpha': 0.9},
                         zorder=8,
                     )
 
@@ -1421,6 +1730,7 @@ class BPMNDiagramGenerator:
                 format='png',
                 dpi=self.dpi,
                 bbox_inches='tight',
+                pad_inches=0.14,
                 facecolor=self.WHITE,
                 edgecolor='none',
             )
@@ -1436,26 +1746,10 @@ class BPMNDiagramGenerator:
         self,
         processes: List[Dict[str, Any]],
         sequence_flows: List[Tuple[str, str, str]],
+        include_legend: bool = False,
     ) -> bytes:
         """Generate integration flow diagram showing process steps."""
         try:
-            fig, ax = plt.subplots(1, 1, figsize=(14, 8))
-            ax.set_xlim(0, 100)
-            ax.set_ylim(0, 70)
-            ax.axis('off')
-            ax.set_facecolor(self.WHITE)
-            fig.patch.set_facecolor(self.WHITE)
-            
-            # Title
-            ax.text(50, 67, f"Integration Flow: {self.iflow_name}", fontsize=14,
-                   ha='center', weight='bold', color=self.BLUE)
-            
-            # Main container
-            container = FancyBboxPatch((5, 10), 90, 50, boxstyle="round,pad=0.01,rounding_size=0.3",
-                                      facecolor=self.LIGHT_GRAY, edgecolor=self.GRAY, linewidth=1.5)
-            ax.add_patch(container)
-            ax.text(50, 57, "Integration Process", fontsize=11, ha='center', weight='bold')
-            
             # Build node list from sequence flows
             nodes = []
             for src, tgt, _ in sequence_flows:
@@ -1467,37 +1761,27 @@ class BPMNDiagramGenerator:
             # If no sequence flows, use process names
             if not nodes:
                 nodes = [p.get('name', f'Step {i+1}') for i, p in enumerate(processes)]
-            
+
             if not nodes:
                 nodes = ['Start', 'Process', 'End']
 
             nodes = self._order_nodes(sequence_flows, nodes)
-            
-            # Calculate positions
-            num_nodes = len(nodes)
-            max_per_row = 6
-            row_count = max(1, (num_nodes + max_per_row - 1) // max_per_row)
 
-            if row_count == 1:
-                row_ys = [35]
-            else:
-                vertical_span = 20
-                step_y = vertical_span / max(row_count - 1, 1)
-                row_ys = [42 - (idx * step_y) for idx in range(row_count)]
-            
-            node_positions = {}
-            for row_index, y in enumerate(row_ys):
-                row_nodes = nodes[row_index * max_per_row:(row_index + 1) * max_per_row]
-                count = len(row_nodes)
-                if count == 1:
-                    x_positions = [50]
-                else:
-                    start_x, end_x = 12, 88
-                    step_x = (end_x - start_x) / (count - 1)
-                    x_positions = [start_x + (i * step_x) for i in range(count)]
-
-                for node, x in zip(row_nodes, x_positions):
-                    node_positions[node] = (x, y)
+            node_types: Dict[str, str] = {}
+            node_props: Dict[str, Dict[str, str]] = {}
+            for process in processes:
+                process_elem = process.get('element') if isinstance(process, dict) else None
+                if process_elem is None:
+                    continue
+                for elem in process_elem.iter():
+                    element_name = str(elem.attrib.get('name', '')).strip()
+                    if not element_name:
+                        continue
+                    element_type = self._local_name(elem.tag).lower()
+                    if element_type == 'sequenceflow':
+                        continue
+                    node_types.setdefault(element_name, element_type)
+                    node_props.setdefault(element_name, self._extract_ifl_property_map(elem))
             
             # Determine start/end nodes
             sources = {src for src, _, _ in sequence_flows}
@@ -1509,86 +1793,267 @@ class BPMNDiagramGenerator:
                 start_nodes = {name for name in nodes if 'start' in name.lower()}
             if not end_nodes:
                 end_nodes = {name for name in nodes if 'end' in name.lower()}
+
+            # Calculate positions from graph depth so gateways branch vertically.
+            num_nodes = len(nodes)
+            adjacency: Dict[str, List[str]] = {node: [] for node in nodes}
+            indegree: Dict[str, int] = {node: 0 for node in nodes}
+            for src, tgt, _ in sequence_flows:
+                adjacency.setdefault(src, [])
+                adjacency.setdefault(tgt, [])
+                indegree.setdefault(src, 0)
+                indegree.setdefault(tgt, 0)
+                if tgt not in adjacency[src]:
+                    adjacency[src].append(tgt)
+                    indegree[tgt] += 1
+
+            roots = [node for node in nodes if node in start_nodes] or [node for node in nodes if indegree.get(node, 0) == 0]
+            if not roots and nodes:
+                roots = [nodes[0]]
+
+            depths: Dict[str, int] = {}
+            queue = deque()
+            for root_node in roots:
+                depths[root_node] = 0
+                queue.append(root_node)
+
+            while queue:
+                current = queue.popleft()
+                current_depth = depths.get(current, 0)
+                for target in adjacency.get(current, []):
+                    next_depth = current_depth + 1
+                    if next_depth > depths.get(target, -1):
+                        depths[target] = next_depth
+                        queue.append(target)
+
+            for node in nodes:
+                depths.setdefault(node, max(depths.values(), default=0) + 1 if depths else 0)
+
+            ordered_depths = sorted(set(depths.values()))
+            depth_groups: Dict[int, List[str]] = {
+                depth: [node for node in nodes if depths.get(node) == depth]
+                for depth in ordered_depths
+            }
+            max_lane_count = max((len(group) for group in depth_groups.values()), default=1)
+
+            canvas_w = 120.0
+            canvas_h = max(52.0, 42.0 + (max_lane_count * 18.0))
+            fig_w = min(14.0, max(9.5, canvas_w / 12.0))
+            fig_h = min(7.0, max(4.2, canvas_h / 13.0))
+
+            fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h))
+            ax.set_xlim(0, canvas_w)
+            ax.set_ylim(canvas_h, 0)
+            ax.axis('off')
+            ax.set_facecolor(self.WHITE)
+            fig.patch.set_facecolor(self.WHITE)
+
+            process_title = self.iflow_name
+            if len(processes) == 1:
+                process_title = str(processes[0].get('name') or process_title)
+            elif processes:
+                process_title = "Integration Process"
+
+            container_left = 5.0
+            container_top = 5.0
+            container_right = canvas_w - 5.0
+            container_bottom = canvas_h - 5.0
+            header_h = 8.0
+            self._draw_process_container(
+                ax,
+                container_left,
+                container_top,
+                container_right,
+                container_bottom,
+                process_title,
+                header_h,
+            )
+            if include_legend:
+                self._draw_local_process_legend(ax, container_left, container_bottom)
+
+            node_positions = {}
+            depth_count = max(len(ordered_depths), 1)
+            x_start, x_end = 17.0, canvas_w - 17.0
+            x_step = 0.0 if depth_count == 1 else (x_end - x_start) / (depth_count - 1)
+            content_top = container_top + header_h
+            content_bottom = container_bottom
+            center_y = content_top + ((content_bottom - content_top) / 2.0)
+            lane_gap = 15.5
+
+            for depth_index, depth in enumerate(ordered_depths):
+                group = depth_groups.get(depth, [])
+                group_count = max(len(group), 1)
+                x = canvas_w / 2.0 if depth_count == 1 else x_start + (depth_index * x_step)
+                for idx, node in enumerate(group):
+                    y = center_y + ((idx - ((group_count - 1) / 2.0)) * lane_gap)
+                    node_positions[node] = (x, y)
             
             # Draw nodes
-            box_w = 11 if num_nodes <= 8 else 9.5
-            box_h = 6.5
-            event_radius = 2.5
-            font_size = 8 if num_nodes <= 8 else 7
+            if include_legend:
+                box_w = 18.0 if num_nodes <= 8 else 15.5
+                box_h = 10.2
+            else:
+                box_w = 18.0 if num_nodes <= 8 else 15.5
+                box_h = 10.2
+            event_radius = 3.0
+            diamond_w = 8.0
+            diamond_h = 8.0
+            font_size = 7.4 if num_nodes <= 8 else 6.8
             event_nodes = start_nodes.union(end_nodes)
+
+            def edge_offset(node_name: str) -> float:
+                lowered = node_name.lower()
+                node_type = node_types.get(node_name, '')
+                if 'event' in node_type or node_name in event_nodes or 'start' in lowered or 'end' in lowered:
+                    return event_radius
+                if not include_legend and self._is_gateway_like(node_name, node_type):
+                    return diamond_w / 2.0
+                return box_w / 2.0
+
+            # Draw sequence flows first so shapes sit cleanly above connector ends.
+            for src, tgt, label in sequence_flows:
+                if src not in node_positions or tgt not in node_positions:
+                    continue
+
+                x1, y1 = node_positions[src]
+                x2, y2 = node_positions[tgt]
+                dx = x2 - x1
+                dy = y2 - y1
+                distance = (dx ** 2 + dy ** 2) ** 0.5
+                if distance == 0:
+                    continue
+
+                ux = dx / distance
+                uy = dy / distance
+                start = (x1 + (ux * edge_offset(src)), y1 + (uy * edge_offset(src)))
+                end = (x2 - (ux * edge_offset(tgt)), y2 - (uy * edge_offset(tgt)))
+                self._draw_sequence_flow(ax, [start, end], self.SAP_SEQ_FLOW)
+
+                if label:
+                    label_x = (start[0] + end[0]) / 2.0
+                    label_y = (start[1] + end[1]) / 2.0
+                    if include_legend:
+                        if abs(dy) > 1.5:
+                            label_y += 4.8 if dy > 0 else -4.8
+                        else:
+                            label_y -= 5.0
+                        label_ha = 'center'
+                    else:
+                        label_x, label_y, label_ha = self._flow_label_position([start, end])
+                    ax.text(
+                        label_x,
+                        label_y,
+                        self._truncate_label(label, 28),
+                        fontsize=6.4,
+                        color='#4D5962',
+                        ha=label_ha,
+                        va='center',
+                        bbox={'facecolor': self.WHITE, 'edgecolor': 'none', 'pad': 0.2, 'alpha': 0.9},
+                        zorder=8,
+                    )
             
             for node, (x, y) in node_positions.items():
-                display = self._truncate_label(node, max_len=20)
+                display = str(node or "").replace('_', ' ')
                 node_lower = node.lower()
+                node_type = node_types.get(node, '')
                 
-                if node in start_nodes or 'start' in node_lower:
-                    # Start event - green circle
-                    circle = Circle((x, y), event_radius, facecolor=self.GREEN, edgecolor=self.GREEN, linewidth=2, zorder=2)
+                if 'startevent' in node_type or node in start_nodes or 'start' in node_lower:
+                    circle = Circle(
+                        (x, y),
+                        event_radius,
+                        facecolor=self.WHITE,
+                        edgecolor=self.SAP_EVENT_EDGE,
+                        linewidth=0.9,
+                        zorder=5,
+                    )
                     ax.add_patch(circle)
-                    ax.text(x, y - 5.5, display, fontsize=font_size, ha='center', zorder=3)
-                elif node in end_nodes or 'end' in node_lower:
-                    # End event - orange circle
-                    circle = Circle((x, y), event_radius, facecolor=self.ORANGE, edgecolor=self.ORANGE, linewidth=2, zorder=2)
+                    ax.text(
+                        x,
+                        y + 6.0,
+                        self._wrap_label(display, width=12, max_lines=2),
+                        fontsize=font_size,
+                        ha='center',
+                        va='top',
+                        color=self.SAP_TEXT,
+                        zorder=6,
+                    )
+                elif 'endevent' in node_type or node in end_nodes or 'end' in node_lower:
+                    circle = Circle(
+                        (x, y),
+                        event_radius,
+                        facecolor=self.WHITE,
+                        edgecolor=self.SAP_EVENT_EDGE,
+                        linewidth=1.8,
+                        zorder=5,
+                    )
                     ax.add_patch(circle)
-                    ax.text(x, y - 5.5, display, fontsize=font_size, ha='center', zorder=3)
+                    ax.text(
+                        x,
+                        y + 6.0,
+                        self._wrap_label(display, width=12, max_lines=2),
+                        fontsize=font_size,
+                        ha='center',
+                        va='top',
+                        color=self.SAP_TEXT,
+                        zorder=6,
+                    )
+                elif not include_legend and self._is_gateway_like(node, node_type):
+                    diamond = patches.Polygon(
+                        [
+                            (x, y - (diamond_h / 2.0)),
+                            (x + (diamond_w / 2.0), y),
+                            (x, y + (diamond_h / 2.0)),
+                            (x - (diamond_w / 2.0), y),
+                        ],
+                        closed=True,
+                        facecolor=self.WHITE,
+                        edgecolor=self.SAP_GATEWAY_EDGE,
+                        linewidth=0.85,
+                        zorder=5,
+                    )
+                    ax.add_patch(diamond)
+                    ax.text(
+                        x,
+                        y + 6.5,
+                        self._wrap_label(display, width=13, max_lines=2),
+                        fontsize=font_size,
+                        ha='center',
+                        va='top',
+                        color=self.SAP_TEXT,
+                        zorder=6,
+                    )
                 else:
-                    # Task box
+                    visual_kind = self._activity_visual_kind(
+                        display,
+                        node_type,
+                        node_props.get(node, {}),
+                    )
+                    fill_color, edge_color = (
+                        self._activity_style(visual_kind)
+                        if include_legend
+                        else (self.SAP_TASK_FILL, self.SAP_TASK_EDGE)
+                    )
                     box = FancyBboxPatch((x - box_w/2, y - box_h/2), box_w, box_h,
-                                        boxstyle="round,pad=0.02,rounding_size=0.3",
-                                        facecolor=self.LIGHT_BLUE, edgecolor=self.BLUE, linewidth=1.5, zorder=2)
+                                        boxstyle="round,pad=0.01,rounding_size=0.7",
+                                        facecolor=fill_color, edgecolor=edge_color, linewidth=0.85, zorder=5)
                     ax.add_patch(box)
+                    self._draw_task_corner_icon(ax, x - box_w/2, y - box_h/2, scale=0.42)
                     ax.text(
                         x,
                         y,
-                        self._wrap_label(display, width=14 if box_w >= 10 else 12, max_lines=2),
-                        fontsize=font_size,
+                        self._wrap_label(display, width=18 if box_w >= 18 else 15, max_lines=4),
+                        fontsize=font_size if len(display) <= 28 else max(6.1, font_size - 0.6),
                         ha='center',
                         va='center',
-                        zorder=3
+                        color=self.SAP_TEXT,
+                        zorder=6
                     )
-            
-            # Draw sequence flows
-            for src, tgt, label in sequence_flows:
-                if src in node_positions and tgt in node_positions:
-                    x1, y1 = node_positions[src]
-                    x2, y2 = node_positions[tgt]
-
-                    dx = x2 - x1
-                    dy = y2 - y1
-                    distance = (dx ** 2 + dy ** 2) ** 0.5
-                    if distance == 0:
-                        continue
-
-                    ux = dx / distance
-                    uy = dy / distance
-
-                    src_offset = event_radius if src in event_nodes else box_w / 2
-                    tgt_offset = event_radius if tgt in event_nodes else box_w / 2
-
-                    start_x = x1 + (ux * src_offset)
-                    start_y = y1 + (uy * src_offset)
-                    end_x = x2 - (ux * tgt_offset)
-                    end_y = y2 - (uy * tgt_offset)
-
-                    ax.annotate('', xy=(end_x, end_y), xytext=(start_x, start_y),
-                               arrowprops=dict(arrowstyle='->', color=self.GRAY, lw=1.5), zorder=1)
-            
-            # Legend
-            ax.add_patch(Circle((15, 5), 1.5, facecolor=self.GREEN, edgecolor=self.GREEN))
-            ax.text(18, 5, "Start", fontsize=8, va='center')
-            
-            ax.add_patch(FancyBboxPatch((30, 3.5), 5, 3, boxstyle="round,pad=0.02,rounding_size=0.2",
-                                       facecolor=self.LIGHT_BLUE, edgecolor=self.BLUE))
-            ax.text(38, 5, "Task", fontsize=8, va='center')
-            
-            ax.add_patch(Circle((55, 5), 1.5, facecolor=self.ORANGE, edgecolor=self.ORANGE))
-            ax.text(58, 5, "End", fontsize=8, va='center')
             
             plt.tight_layout()
             
             buf = io.BytesIO()
             fig.savefig(buf, format='png', dpi=self.dpi, bbox_inches='tight',
-                       facecolor=self.WHITE, edgecolor='none')
+                       pad_inches=0.14, facecolor=self.WHITE, edgecolor='none')
             buf.seek(0)
             plt.close(fig)
             
@@ -1656,8 +2121,14 @@ def generate_process_diagram_bytes(parser, process: Dict[str, Any]) -> Optional[
             return None
 
         generator = BPMNDiagramGenerator(parser.iflow_name)
+        process_id = str(process.get("id") or process_elem.attrib.get("id", "")).strip()
+        if process_id:
+            bpmn_diagram = generator.generate_integration_flow_diagram_from_bpmndi(parser, process_id=process_id)
+            if bpmn_diagram:
+                return bpmn_diagram
+
         sequence_flows = parser.extract_sequence_flows_for_process(process_elem)
-        return generator.generate_integration_flow_diagram([process], sequence_flows)
+        return generator.generate_integration_flow_diagram([process], sequence_flows, include_legend=True)
     except Exception as e:
         logger.error(f"Error generating process diagram: {e}")
         return None
@@ -1681,13 +2152,33 @@ def extract_exception_subdiagram_bytes(parser, integration_diagram_bytes: bytes)
         participants = generator._collect_participants(root)
         shapes = generator._collect_bpmndi_shapes(root)
         edges = generator._collect_bpmndi_edges(root)
+        flow_meta = generator._build_flow_metadata(root)
 
         if not shapes:
             return None
 
+        process_pool_bounds: Optional[Dict[str, float]] = None
+        for participant_id, info in participants.items():
+            if participant_id not in shapes or not info.get('process_ref'):
+                continue
+            bounds = shapes[participant_id]
+            area = bounds['w'] * bounds['h']
+            if process_pool_bounds is None or area > (process_pool_bounds['w'] * process_pool_bounds['h']):
+                process_pool_bounds = bounds
+
+        allowed_node_ids = generator._node_ids_inside_bounds(shapes, participants, process_pool_bounds)
+
+        subprocess_by_id = {
+            elem.attrib.get('id', ''): elem
+            for elem in root.iter()
+            if generator._local_name(elem.tag).lower() == 'subprocess' and elem.attrib.get('id')
+        }
+
         candidate: Optional[Dict[str, Any]] = None
         for element_id, bounds in shapes.items():
             if element_id in participants:
+                continue
+            if allowed_node_ids is not None and element_id not in allowed_node_ids:
                 continue
 
             meta = element_meta.get(element_id, {})
@@ -1701,35 +2192,49 @@ def extract_exception_subdiagram_bytes(parser, integration_diagram_bytes: bytes)
             sort_key = (priority, area)
 
             if candidate is None or sort_key > candidate['sort_key']:
-                candidate = {'bounds': bounds, 'sort_key': sort_key}
+                candidate = {
+                    'bounds': bounds,
+                    'sort_key': sort_key,
+                    'element': subprocess_by_id.get(element_id),
+                }
 
         if candidate is None:
             return None
 
+        sub_process_elem = candidate.get('element')
+        if sub_process_elem is not None:
+            sequence_flows = parser.extract_sequence_flows_for_process(sub_process_elem)
+            process_info = {
+                'id': sub_process_elem.attrib.get('id', ''),
+                'name': sub_process_elem.attrib.get('name', 'Exception SubProcess'),
+                'xml': ET.tostring(sub_process_elem, encoding='unicode'),
+                'element': sub_process_elem,
+            }
+            standalone = generator.generate_integration_flow_diagram(
+                [process_info],
+                sequence_flows,
+                include_legend=False,
+            )
+            if standalone:
+                return standalone
+
         sub_bounds = candidate['bounds']
 
-        all_x: List[float] = []
-        all_y: List[float] = []
-        for bounds in shapes.values():
-            all_x.extend([bounds['x'], bounds['x'] + bounds['w']])
-            all_y.extend([bounds['y'], bounds['y'] + bounds['h']])
-        for points in edges.values():
-            all_x.extend([pt[0] for pt in points])
-            all_y.extend([pt[1] for pt in points])
-
-        if not all_x or not all_y:
+        content_bounds = generator._content_bounds_for_process(
+            shapes,
+            edges,
+            participants,
+            flow_meta,
+            allowed_node_ids,
+        )
+        if not content_bounds:
             return None
 
-        min_x, max_x = min(all_x), max(all_x)
-        min_y, max_y = min(all_y), max(all_y)
-        diagram_w = max(max_x - min_x, 1.0)
-        diagram_h = max(max_y - min_y, 1.0)
-
-        pad = max(20.0, min(32.0, max(diagram_w, diagram_h) * 0.03))
-        canvas_left = min_x - pad
-        canvas_right = max_x + pad
-        canvas_top = min_y - pad
-        canvas_bottom = max_y + pad
+        canvas = generator._cpi_canvas_bounds(content_bounds)
+        canvas_left = canvas['left']
+        canvas_right = canvas['right']
+        canvas_top = canvas['top']
+        canvas_bottom = canvas['bottom']
 
         margin_x = max(24.0, sub_bounds['w'] * 0.11)
         margin_y = max(22.0, sub_bounds['h'] * 0.18)

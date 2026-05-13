@@ -4,6 +4,7 @@ from typing import Dict, List, Any, Optional, Tuple
 import xml.etree.ElementTree as ET
 import re
 import logging
+from xml.sax.saxutils import escape as xml_escape
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,16 @@ def should_display_property(key: str, value: Optional[str]) -> bool:
     if "<row>" in rendered and "<cell" in rendered:
         return False
     return True
+
+
+def escape_xml_text(value: Any) -> str:
+    """Escape arbitrary values before embedding them in generated XML snippets."""
+    return xml_escape(str(value or ""))
+
+
+def escape_xml_attr(value: Any) -> str:
+    """Escape arbitrary values before embedding them in generated XML attributes."""
+    return xml_escape(str(value or ""), {'"': "&quot;"})
 
 
 class IFlowParser:
@@ -193,6 +204,86 @@ class IFlowParser:
             'xml': ET.tostring(process, encoding="unicode"),
             'element': process
         }
+
+    @staticmethod
+    def _local_name(tag: str) -> str:
+        """Return XML local name without namespace."""
+        return str(tag or "").split("}")[-1]
+
+    def _collect_bpmndi_shape_areas(self) -> Dict[str, float]:
+        """Collect BPMN-DI shape areas keyed by BPMN element id."""
+        root = self.get_root()
+        areas: Dict[str, float] = {}
+        for elem in root.iter():
+            if self._local_name(elem.tag) != "BPMNShape":
+                continue
+            bpmn_element = elem.attrib.get("bpmnElement", "")
+            if not bpmn_element:
+                continue
+            for child in elem:
+                if self._local_name(child.tag) != "Bounds":
+                    continue
+                try:
+                    width = float(child.attrib.get("width", 0) or 0)
+                    height = float(child.attrib.get("height", 0) or 0)
+                except ValueError:
+                    width = height = 0.0
+                areas[bpmn_element] = width * height
+                break
+        return areas
+
+    def _participant_ifl_type(self, participant: ET.Element) -> str:
+        """Read the CPI participant type from namespace attributes or extension properties."""
+        participant_type = participant.attrib.get(f"{{{NS['ifl']}}}type", "")
+        if participant_type:
+            return participant_type
+
+        for prop in participant.findall(".//ifl:property", NS):
+            key = prop.findtext("key")
+            value = prop.findtext("value")
+            if str(key or "").strip().lower() == "ifl:type" and value:
+                return value.strip()
+        return ""
+
+    def classify_integration_processes(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Classify top-level CPI integration processes into main and local processes."""
+        root = self.get_root()
+        processes = self.get_all_processes()
+        process_by_id = {process.attrib.get("id", ""): process for process in processes}
+        shape_areas = self._collect_bpmndi_shape_areas()
+
+        integration_refs: List[Dict[str, Any]] = []
+        for participant in root.findall(".//bpmn2:participant", NS):
+            process_ref = participant.attrib.get("processRef", "")
+            process = process_by_id.get(process_ref)
+            if process is None:
+                continue
+
+            participant_type = self._participant_ifl_type(participant).lower()
+            if participant_type and "integrationprocess" not in participant_type:
+                continue
+
+            info = self.get_process_info(process)
+            info["participant_id"] = participant.attrib.get("id", "")
+            info["participant_name"] = participant.attrib.get("name", "")
+            info["participant_type"] = participant_type
+            info["shape_area"] = shape_areas.get(participant.attrib.get("id", ""), 0.0)
+            info["flow_count"] = len(process.findall(".//bpmn2:sequenceFlow", NS))
+            integration_refs.append(info)
+
+        if not integration_refs:
+            return (self.get_integration_processes()[:1], [])
+
+        main_process = max(
+            integration_refs,
+            key=lambda item: (
+                float(item.get("shape_area") or 0.0),
+                int(item.get("flow_count") or 0),
+            ),
+        )
+        main_id = main_process.get("id", "")
+        local_processes = [item for item in integration_refs if item.get("id") != main_id]
+        return ([main_process], local_processes)
     
     def get_integration_processes(self) -> List[Dict[str, Any]]:
         """Get all integration processes with their info."""
@@ -338,7 +429,7 @@ class IFlowParser:
         root = self.get_root()
         mappings = []
         for process in root.findall(".//bpmn2:process", NS):
-            for call_activity in process.findall("bpmn2:callActivity", NS):
+            for call_activity in process.findall(".//bpmn2:callActivity", NS):
                 for ext_elem in call_activity.findall("bpmn2:extensionElements", NS):
                     for prop in ext_elem.findall("ifl:property", NS):
                         key = prop.findtext("key")
@@ -410,7 +501,12 @@ class IFlowParser:
         sender_props = self.extract_sender_properties()
         xml = "<SenderProperties>\n"
         for key, value in sender_props:
-            xml += f"  <Property>\n    <Key>{key}</Key>\n    <Value>{value}</Value>\n  </Property>\n"
+            xml += (
+                "  <Property>\n"
+                f"    <Key>{escape_xml_text(key)}</Key>\n"
+                f"    <Value>{escape_xml_text(value)}</Value>\n"
+                "  </Property>\n"
+            )
         xml += "</SenderProperties>"
         return xml
     
@@ -419,7 +515,12 @@ class IFlowParser:
         receiver_props = self.extract_receiver_properties()
         xml = "<ReceiverProperties>\n"
         for key, value in receiver_props:
-            xml += f"  <Property>\n    <Key>{key}</Key>\n    <Value>{value}</Value>\n  </Property>\n"
+            xml += (
+                "  <Property>\n"
+                f"    <Key>{escape_xml_text(key)}</Key>\n"
+                f"    <Value>{escape_xml_text(value)}</Value>\n"
+                "  </Property>\n"
+            )
         xml += "</ReceiverProperties>"
         return xml
     
@@ -430,7 +531,12 @@ class IFlowParser:
         for idx, mapping_props in enumerate(mapping_props_list, 1):
             xml += f'  <MappingActivity id="{idx}">\n'
             for key, value in mapping_props:
-                xml += f"    <Property>\n      <Key>{key}</Key>\n      <Value>{value}</Value>\n    </Property>\n"
+                xml += (
+                    "    <Property>\n"
+                    f"      <Key>{escape_xml_text(key)}</Key>\n"
+                    f"      <Value>{escape_xml_text(value)}</Value>\n"
+                    "    </Property>\n"
+                )
             xml += "  </MappingActivity>\n"
         xml += "</Mappings>"
         return xml
@@ -443,12 +549,25 @@ class IFlowParser:
             xml += f'  <ExceptionSubProcess id="{idx}">\n'
             xml += "    <Properties>\n"
             for key, value in exc["subproc_props"]:
-                xml += f"      <Property>\n        <Key>{key}</Key>\n        <Value>{value}</Value>\n      </Property>\n"
+                xml += (
+                    "      <Property>\n"
+                    f"        <Key>{escape_xml_text(key)}</Key>\n"
+                    f"        <Value>{escape_xml_text(value)}</Value>\n"
+                    "      </Property>\n"
+                )
             xml += "    </Properties>\n"
             for child in exc["children"]:
-                xml += f'    <ChildElement type="{child["tag"]}" name="{child["name"]}">\n'
+                xml += (
+                    f'    <ChildElement type="{escape_xml_attr(child["tag"])}" '
+                    f'name="{escape_xml_attr(child["name"])}">\n'
+                )
                 for key, value in child["props"]:
-                    xml += f"      <Property>\n        <Key>{key}</Key>\n        <Value>{value}</Value>\n      </Property>\n"
+                    xml += (
+                        "      <Property>\n"
+                        f"        <Key>{escape_xml_text(key)}</Key>\n"
+                        f"        <Value>{escape_xml_text(value)}</Value>\n"
+                        "      </Property>\n"
+                    )
                 xml += "    </ChildElement>\n"
             xml += "  </ExceptionSubProcess>\n"
         xml += "</Exceptions>"
@@ -459,6 +578,9 @@ class IFlowParser:
         metadata = self.extract_metadata()
         xml = "<Metadata>\n"
         for k, v in metadata.items():
-            xml += f"<{k}>{v}</{k}>\n"
+            tag = re.sub(r"[^A-Za-z0-9_.-]", "_", str(k or "metadata"))
+            if not re.match(r"^[A-Za-z_]", tag):
+                tag = f"_{tag}"
+            xml += f"<{tag}>{escape_xml_text(v)}</{tag}>\n"
         xml += "</Metadata>"
         return xml

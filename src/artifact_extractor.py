@@ -138,20 +138,54 @@ class ParameterExtractor:
         """Extract key-value parameters."""
         params = {}
         
-        content = self.prop_path.read_text(encoding='utf-8')
-        
-        for line in content.splitlines():
+        content = _read_text_with_fallback(self.prop_path)
+
+        logical_lines: List[str] = []
+        buffer = ""
+        for raw_line in content.splitlines():
+            line = raw_line.rstrip()
+            if buffer:
+                buffer += line.lstrip()
+            else:
+                buffer = line
+
+            backslash_count = len(buffer) - len(buffer.rstrip("\\"))
+            if backslash_count % 2 == 1:
+                buffer = buffer[:-1]
+                continue
+
+            logical_lines.append(buffer)
+            buffer = ""
+
+        if buffer:
+            logical_lines.append(buffer)
+
+        for line in logical_lines:
             line = line.strip()
             # Skip comments and empty lines
-            if not line or line.startswith('#'):
+            if not line or line.startswith('#') or line.startswith('!'):
                 continue
-            
-            # Handle escaped spaces in keys
-            line = line.replace('\\ ', ' ')
-            
-            if '=' in line:
-                key, value = line.split('=', 1)
-                params[key.strip()] = value.strip()
+
+            split_idx = -1
+            for idx, char in enumerate(line):
+                if char not in "=:":
+                    continue
+                backslash_count = 0
+                cursor = idx - 1
+                while cursor >= 0 and line[cursor] == "\\":
+                    backslash_count += 1
+                    cursor -= 1
+                if backslash_count % 2 == 0:
+                    split_idx = idx
+                    break
+
+            if split_idx == -1:
+                continue
+
+            key = _decode_java_properties_text(line[:split_idx].strip())
+            value = _decode_java_properties_text(line[split_idx + 1:].strip())
+            if key:
+                params[key] = value
         
         return params
 
@@ -189,6 +223,32 @@ def _read_text_with_fallback(path: Path) -> str:
             continue
 
     return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _decode_java_properties_text(value: str) -> str:
+    """Decode common Java .properties escape sequences safely."""
+    value = str(value or "")
+
+    def decode_unicode(match: re.Match[str]) -> str:
+        try:
+            return chr(int(match.group(1), 16))
+        except ValueError:
+            return match.group(0)
+
+    value = re.sub(r"\\u([0-9a-fA-F]{4})", decode_unicode, value)
+    replacements = {
+        r"\:": ":",
+        r"\=": "=",
+        r"\ ": " ",
+        r"\t": "\t",
+        r"\n": "\n",
+        r"\r": "\r",
+        r"\f": "\f",
+        r"\\": "\\",
+    }
+    for escaped, rendered in replacements.items():
+        value = value.replace(escaped, rendered)
+    return value
 
 
 def _normalize_space(text: str) -> str:

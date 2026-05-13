@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import tempfile
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +51,23 @@ class ZipHandler:
         
         try:
             with zipfile.ZipFile(self.zip_path, 'r') as zf:
-                # Check for suspicious paths (path traversal)
-                for name in zf.namelist():
-                    if name.startswith('/') or '..' in name:
-                        raise ZipHandlerError(f"Suspicious path in ZIP: {name}")
-                
+                root = self.extract_dir.resolve()
+                for member in zf.infolist():
+                    member_name = member.filename.replace("\\", "/")
+                    target = (self.extract_dir / member_name).resolve()
+                    try:
+                        target.relative_to(root)
+                    except ValueError:
+                        raise ZipHandlerError(f"Suspicious path in ZIP: {member.filename}")
+                    if os.path.isabs(member_name) or Path(member_name).drive:
+                        raise ZipHandlerError(f"Suspicious absolute path in ZIP: {member.filename}")
+
                 zf.extractall(self.extract_dir)
                 logger.debug(f"Extracted {len(zf.namelist())} files to {self.extract_dir}")
         except zipfile.BadZipFile as e:
             raise ZipHandlerError(f"Invalid ZIP file: {e}")
+        except ZipHandlerError:
+            raise
         except Exception as e:
             raise ZipHandlerError(f"Failed to extract ZIP: {e}")
         
@@ -75,7 +84,10 @@ class ZipHandler:
         
         self.artifacts = {}
         for artifact_type, pattern in self.SUPPORTED_ARTIFACTS.items():
-            self.artifacts[artifact_type] = list(base_dir.rglob(pattern))
+            self.artifacts[artifact_type] = sorted(
+                base_dir.rglob(pattern),
+                key=lambda path: str(path).lower(),
+            )
             if self.artifacts[artifact_type]:
                 logger.debug(f"Found {len(self.artifacts[artifact_type])} {artifact_type} file(s)")
         
@@ -121,6 +133,9 @@ def extract_from_directory(directory: Path) -> Dict[str, List[Path]]:
     
     artifacts = {}
     for artifact_type, pattern in ZipHandler.SUPPORTED_ARTIFACTS.items():
-        artifacts[artifact_type] = list(directory.rglob(pattern))
+        artifacts[artifact_type] = sorted(
+            directory.rglob(pattern),
+            key=lambda path: str(path).lower(),
+        )
     
     return artifacts

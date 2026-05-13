@@ -498,7 +498,7 @@ def _score_candidate(file_path: Path, base_dir: Path, parent_dir: Path) -> int:
         score += 6
     if re.search(r"\bspec\b", stem):
         score += 4
-    if re.search(r"\brequirement\b", stem):
+    if re.search(r"\brequirements?\b", stem):
         score += 3
     if "business" in stem:
         score += 2
@@ -510,12 +510,21 @@ def _score_candidate(file_path: Path, base_dir: Path, parent_dir: Path) -> int:
         score -= 10
     if "readme" in stem:
         score -= 6
-    if "requirements" in stem:
+    if stem == "requirements" or full_name == "requirements.txt":
         score -= 8
     if "changelog" in stem:
         score -= 4
 
-    path_parts = [part.lower() for part in file_path.parts]
+    path_parts: List[str] = [file_path.name.lower()]
+    for root in (base_dir, parent_dir):
+        try:
+            path_parts = [
+                part.lower()
+                for part in file_path.resolve().relative_to(root.resolve()).parts
+            ]
+            break
+        except Exception:
+            continue
     if any(part in EXCLUDED_AUTO_SPEC_DIR_NAMES for part in path_parts):
         score -= 12
 
