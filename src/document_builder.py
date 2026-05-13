@@ -810,6 +810,20 @@ def build_specification_document(
         except ImportError as e:
             print(f"   [WARN] Diagrams not available: {e}")
 
+    if include_diagrams and diagram_bytes:
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = "".join(c for c in iflow_name if c.isalnum() or c in "._- ")
+            for dtype in ["integration_flow", "sender", "receiver"]:
+                img_bytes = diagram_bytes.get(dtype)
+                if not img_bytes:
+                    continue
+                image_path = output_dir / f"{safe_name}_{dtype}.png"
+                with open(image_path, "wb") as image_file:
+                    image_file.write(img_bytes)
+        except Exception as e:
+            print(f"   [WARN] Could not save standalone diagram images: {e}")
+
     # ========================================================================
     # BATCH AI GENERATION
     # ========================================================================
