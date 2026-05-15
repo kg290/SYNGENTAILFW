@@ -448,40 +448,74 @@ class IFlowParser:
         """Extract exception subprocess properties."""
         root = self.get_root()
         exceptions = []
+        seen_ids = set()
+
+        def is_exception_subprocess(sub_proc: ET.Element) -> bool:
+            subproc_name = str(sub_proc.attrib.get("name", "")).strip().lower()
+            has_error_event = any(
+                self._local_name(elem.tag).lower() == "erroreventdefinition"
+                for elem in sub_proc.iter()
+            )
+
+            for ext_elem in sub_proc.findall("bpmn2:extensionElements", NS):
+                for prop in ext_elem.findall("ifl:property", NS):
+                    key = str(prop.findtext("key") or "").strip()
+                    value = str(prop.findtext("value") or "").strip()
+                    normalized_value = value.lower()
+                    if key == "activityType" and normalized_value == "erroreventsubprocesstemplate":
+                        return True
+                    if "erroreventsubprocesstemplate" in normalized_value:
+                        return True
+
+            return has_error_event and any(token in subproc_name for token in ["exception", "error"])
+
         for process in root.findall(".//bpmn2:process", NS):
-            for sub_proc in process.findall("bpmn2:subProcess", NS):
-                found = False
+            process_id = process.attrib.get("id", "")
+            process_name = process.attrib.get("name", process_id or "Integration Process")
+            for sub_proc in process.findall(".//bpmn2:subProcess", NS):
+                subproc_id = sub_proc.attrib.get("id", "")
+                if subproc_id and subproc_id in seen_ids:
+                    continue
+                if not is_exception_subprocess(sub_proc):
+                    continue
+                if subproc_id:
+                    seen_ids.add(subproc_id)
+
                 for ext_elem in sub_proc.findall("bpmn2:extensionElements", NS):
-                    for prop in ext_elem.findall("ifl:property", NS):
-                        key = prop.findtext("key")
-                        value = prop.findtext("value")
-                        if key and value and key.strip() == "activityType" and value.strip() == "ErrorEventSubProcessTemplate":
-                            found = True
-                            break
-                    if found:
-                        subproc_props = []
-                        for p in ext_elem.findall("ifl:property", NS):
-                            k = p.findtext("key")
-                            v = p.findtext("value")
+                    subproc_props = []
+                    for p in ext_elem.findall("ifl:property", NS):
+                        k = p.findtext("key")
+                        v = p.findtext("value")
+                        if k and should_display_property(k, v):
+                            subproc_props.append([k, v if v else ""])
+                    break
+                else:
+                    subproc_props = []
+
+                exc_data = {
+                    "id": subproc_id,
+                    "name": sub_proc.attrib.get("name", "Exception SubProcess"),
+                    "process_id": process_id,
+                    "process_name": process_name,
+                    "element": sub_proc,
+                    "subproc_props": subproc_props,
+                    "children": [],
+                }
+                for child in list(sub_proc):
+                    for ext_elem_child in child.findall("bpmn2:extensionElements", NS):
+                        child_props = []
+                        for prop in ext_elem_child.findall("ifl:property", NS):
+                            k = prop.findtext("key")
+                            v = prop.findtext("value")
                             if k and should_display_property(k, v):
-                                subproc_props.append([k, v if v else ""])
-                        exc_data = {"subproc_props": subproc_props, "children": []}
-                        for child in list(sub_proc):
-                            for ext_elem_child in child.findall("bpmn2:extensionElements", NS):
-                                child_props = []
-                                for prop in ext_elem_child.findall("ifl:property", NS):
-                                    k = prop.findtext("key")
-                                    v = prop.findtext("value")
-                                    if k and should_display_property(k, v):
-                                        child_props.append([k, v if v else ""])
-                                if child_props:
-                                    exc_data["children"].append({
-                                        "tag": child.tag.split("}")[-1],
-                                        "name": child.attrib.get("name", ""),
-                                        "props": child_props,
-                                    })
-                        exceptions.append(exc_data)
-                        break
+                                child_props.append([k, v if v else ""])
+                        if child_props:
+                            exc_data["children"].append({
+                                "tag": child.tag.split("}")[-1],
+                                "name": child.attrib.get("name", ""),
+                                "props": child_props,
+                            })
+                exceptions.append(exc_data)
         return exceptions
     
     def extract_metadata(self) -> Dict[str, str]:

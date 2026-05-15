@@ -20,6 +20,7 @@ matplotlib.use('Agg')  # Non-GUI backend
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.patches import FancyBboxPatch, Circle, FancyArrowPatch, Rectangle
+from matplotlib.transforms import Bbox
 
 logger = logging.getLogger(__name__)
 
@@ -879,7 +880,7 @@ class BPMNDiagramGenerator:
                 colLabels=["Property", "Value"],
                 cellLoc='left',
                 colLoc='left',
-                bbox=[0.05, 0.06, 0.90, 0.72],
+                bbox=Bbox.from_bounds(0.05, 0.06, 0.90, 0.72),
                 colWidths=[0.34, 0.58],
             )
             table.auto_set_font_size(False)
@@ -2110,7 +2111,12 @@ def generate_diagram_bytes(parser, diagram_type: str = "integration_flow") -> Op
         return None
 
 
-def generate_process_diagram_bytes(parser, process: Dict[str, Any]) -> Optional[bytes]:
+def generate_process_diagram_bytes(
+    parser,
+    process: Dict[str, Any],
+    include_legend: bool = True,
+    prefer_bpmndi: bool = True,
+) -> Optional[bytes]:
     """Generate a compact diagram for a single integration/local process."""
     try:
         if not isinstance(process, dict):
@@ -2122,13 +2128,13 @@ def generate_process_diagram_bytes(parser, process: Dict[str, Any]) -> Optional[
 
         generator = BPMNDiagramGenerator(parser.iflow_name)
         process_id = str(process.get("id") or process_elem.attrib.get("id", "")).strip()
-        if process_id:
+        if prefer_bpmndi and process_id:
             bpmn_diagram = generator.generate_integration_flow_diagram_from_bpmndi(parser, process_id=process_id)
             if bpmn_diagram:
                 return bpmn_diagram
 
         sequence_flows = parser.extract_sequence_flows_for_process(process_elem)
-        return generator.generate_integration_flow_diagram([process], sequence_flows, include_legend=True)
+        return generator.generate_integration_flow_diagram([process], sequence_flows, include_legend=include_legend)
     except Exception as e:
         logger.error(f"Error generating process diagram: {e}")
         return None

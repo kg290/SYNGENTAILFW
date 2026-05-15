@@ -10,6 +10,8 @@ The generator parses the iFlow BPMN/XML and related artifacts, resolves external
 - Integration flow diagram
 - Sender diagram
 - Receiver diagram
+- Local integration process diagrams when present
+- Exception subprocess diagrams when present
 
 The generated document includes:
 
@@ -21,7 +23,7 @@ The generated document includes:
 - dedicated receiver section
 - simplified mapping section
 - Groovy script section
-- error handling / exception subprocess section
+- error handling / exception subprocess section with one diagram and summary table per detected exception flow
 - metadata and appendix
 - externalized parameters with usage
 
@@ -29,9 +31,12 @@ The generated document includes:
 
 - Works with ZIP inputs and extracted project folders
 - Resolves runtime placeholders like `{{Address}}` and `${Credential}` where values are available
-- Removes noisy internal property rows from the document
+- Removes noisy internal property rows from the document, including oversized namespace/XML blocks
 - Keeps sender/receiver diagrams in dedicated sections
 - Separates local integration process from exception subprocess content
+- Builds local integration process sections from the parsed BPMN process instead of fixed sample-specific rules
+- Detects exception subprocesses across main and local processes, then renders each detected exception flow dynamically
+- Places large integration diagrams on clean pages and scales or splits them to avoid cropped images and stranded headings
 - Uses fallback document content when AI generation is unavailable or rate-limited
 
 ## Requirements
@@ -181,8 +186,10 @@ temp/
 `src/document_builder.py` is responsible for:
 
 - document structure
-- sender/receiver tables
-- mapping summaries and relation tables
+- detailed sender/receiver tables
+- mapping summaries
+- local integration process summaries, diagrams, and step tables
+- exception subprocess diagrams and matching summary tables
 - Groovy section formatting
 - appendix sections
 - externalized parameter usage tables
@@ -195,7 +202,9 @@ temp/
 - integration flow diagram
 - sender diagram
 - receiver diagram
-- local process diagrams where supported
+- local process diagrams
+- exception subprocess diagrams
+- page-safe combined diagram handling for the integration flow section
 
 ## Notes on generated content
 

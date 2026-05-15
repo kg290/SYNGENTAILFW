@@ -19,6 +19,7 @@ import sys
 import logging
 import io
 import re
+from PIL import Image
 
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor, Cm, Twips
@@ -718,6 +719,7 @@ def build_specification_document(
     functional_spec_analysis = functional_spec_analysis or {}
     scope_mode = str(scope_mode or TECH_SPEC_SCOPE_MODE).strip().lower()
     is_extended_scope = scope_mode == "extended"
+    resolved_output_dir = Path(output_dir) if output_dir is not None else Path(OUTPUT_DIR)
 
     iflow_name = parser.iflow_name
     if hasattr(parser, "classify_integration_processes"):
@@ -738,7 +740,7 @@ def build_specification_document(
 
     builder = EnterpriseDocumentBuilder(
         iflow_name,
-        output_dir,
+        resolved_output_dir,
         runtime_parameters=parameters,
     )
 
@@ -758,6 +760,7 @@ def build_specification_document(
     # ========================================================================
     diagram_bytes: Dict[str, bytes] = {}
     local_process_diagrams: List[Tuple[str, bytes]] = []
+    exception_process_diagrams: List[Tuple[str, str, bytes]] = []
     if include_diagrams:
         print("\n[INFO] Generating diagrams...")
         try:
@@ -794,6 +797,35 @@ def build_specification_document(
                 except Exception as e:
                     print(f"[WARN] {e}")
 
+            if exception_props:
+                for idx, exception in enumerate(exception_props, start=1):
+                    exception_elem = exception.get("element")
+                    if exception_elem is None:
+                        continue
+                    process_name = str(exception.get("process_name") or "").strip()
+                    exception_name = str(exception.get("name") or f"Exception SubProcess {idx}").strip()
+                    label = f"{process_name} - {exception_name}" if process_name else exception_name
+                    exception_key = str(exception.get("id") or f"{idx}:{label}")
+                    print(f"   - Exception Subprocess Diagram ({label})...", end=" ")
+                    try:
+                        exception_img = generate_process_diagram_bytes(
+                            parser,
+                            {
+                                "id": exception.get("id") or exception_elem.attrib.get("id", ""),
+                                "name": exception_name,
+                                "element": exception_elem,
+                            },
+                            include_legend=False,
+                            prefer_bpmndi=False,
+                        )
+                        if exception_img:
+                            exception_process_diagrams.append((exception_key, label, exception_img))
+                            print("[OK]")
+                        else:
+                            print("[SKIP]")
+                    except Exception as e:
+                        print(f"[WARN] {e}")
+
             if local_processes:
                 for idx, process in enumerate(local_processes, start=1):
                     process_name = str(process.get("name") or f"Local Process {idx}")
@@ -812,13 +844,13 @@ def build_specification_document(
 
     if include_diagrams and diagram_bytes:
         try:
-            output_dir.mkdir(parents=True, exist_ok=True)
+            resolved_output_dir.mkdir(parents=True, exist_ok=True)
             safe_name = "".join(c for c in iflow_name if c.isalnum() or c in "._- ")
             for dtype in ["integration_flow", "sender", "receiver"]:
                 img_bytes = diagram_bytes.get(dtype)
                 if not img_bytes:
                     continue
-                image_path = output_dir / f"{safe_name}_{dtype}.png"
+                image_path = resolved_output_dir / f"{safe_name}_{dtype}.png"
                 with open(image_path, "wb") as image_file:
                     image_file.write(img_bytes)
         except Exception as e:
@@ -1041,6 +1073,8 @@ def build_specification_document(
     def filter_detailed_property_rows(
         rows: List[List[str]],
         redundant_keys: Optional[set[str]] = None,
+        keep_keys: Optional[set[str]] = None,
+        preferred_order: Optional[List[str]] = None,
     ) -> List[List[str]]:
         """Keep detailed adapter/config values without the noisiest internal XML blocks."""
         detailed_rows: List[List[str]] = []
@@ -1057,6 +1091,8 @@ def build_specification_document(
         }
         if redundant_keys:
             skip_keys.update(redundant_keys)
+        keep_lookup = {builder._normalize_lookup_key(item) for item in (keep_keys or set())}
+        order_lookup = [builder._normalize_lookup_key(item) for item in (preferred_order or [])]
 
         for key, value in rows:
             key_text = str(key or "").strip()
@@ -1065,7 +1101,7 @@ def build_specification_document(
                 continue
 
             normalized_key = builder._normalize_lookup_key(key_text)
-            if normalized_key in skip_keys:
+            if normalized_key in skip_keys and normalized_key not in keep_lookup:
                 continue
             if "<row>" in value_text and "<cell" in value_text:
                 continue
@@ -1075,6 +1111,15 @@ def build_specification_document(
                 continue
             seen.add(dedupe_key)
             detailed_rows.append([key_text, value_text])
+
+        if order_lookup:
+            priority = {key: idx for idx, key in enumerate(order_lookup)}
+            detailed_rows.sort(
+                key=lambda row: (
+                    priority.get(builder._normalize_lookup_key(row[0]), len(priority)),
+                    row[0].lower(),
+                )
+            )
 
         return detailed_rows
 
@@ -1191,6 +1236,202 @@ def build_specification_document(
                 ]
             )
         return rows
+
+    def build_local_process_detail_rows(process_elem: Any) -> List[List[str]]:
+        if process_elem is None:
+            return []
+
+        rows: List[List[str]] = []
+        for child in parser.extract_child_properties(process_elem):
+            child_tag = str(child.get("tag", "")).strip()
+            child_tag_lower = child_tag.lower()
+            if child_tag_lower in {"sequenceflow", "extensionelements"}:
+                continue
+
+            step_name = str(child.get("name", "")).strip() or str(child.get("heading", "")).strip() or child_tag
+            step_type = str(child.get("activity_type", "")).strip() or child_tag
+
+            if child_tag_lower == "startevent":
+                description = "Starts the local integration process."
+            elif child_tag_lower == "endevent":
+                description = "Marks the end of the local integration process."
+            else:
+                description = "Processes the message as part of the integration flow."
+
+            rows.append([
+                str(len(rows) + 1),
+                step_name,
+                step_type,
+                description,
+            ])
+        return rows
+
+    def should_render_technical_child_properties(props: List[List[str]]) -> bool:
+        if len(props) <= 1:
+            return False
+        for _, value in props:
+            value_text = str(value or "").strip()
+            if not value_text:
+                continue
+            if value_text.startswith("<?xml") or ("<" in value_text and ">" in value_text and len(value_text) > 80):
+                return False
+        return True
+
+    def filter_security_rows(rows: List[List[str]]) -> List[List[str]]:
+        filtered: List[List[str]] = []
+        skip_keys = {
+            "namespacemapping",
+        }
+        for key, value in rows:
+            key_text = str(key or "").strip()
+            value_text = builder._resolve_runtime_placeholders(str(value or "")).strip()
+            normalized_key = builder._normalize_lookup_key(key_text)
+            if not key_text or not value_text:
+                continue
+            if normalized_key in skip_keys:
+                continue
+            filtered.append([key_text, value_text])
+        return filtered
+
+    def filter_exception_rows(rows: List[List[str]]) -> List[List[str]]:
+        filtered: List[List[str]] = []
+        for key, value in rows:
+            key_text = str(key or "").strip()
+            value_text = builder._resolve_runtime_placeholders(str(value or "")).strip()
+            if not key_text or not value_text:
+                continue
+            if value_text.startswith("<?xml") or ("<" in value_text and ">" in value_text and len(value_text) > 80):
+                continue
+            filtered.append([key_text, value_text])
+        return filtered
+
+    def build_exception_summary_rows(exceptions: List[Dict[str, Any]]) -> List[List[str]]:
+        rows: List[List[str]] = []
+        for idx, exc in enumerate(exceptions, start=1):
+            child_names: List[str] = []
+            for child in exc.get("children", []):
+                tag_name = str(child.get("tag", "")).strip().lower()
+                child_name = str(child.get("name", "")).strip()
+                if tag_name in {"startevent", "endevent"}:
+                    continue
+                if child_name and child_name not in child_names:
+                    child_names.append(child_name)
+
+            ordered_steps = child_names
+            exception_elem = exc.get("element")
+            if exception_elem is not None:
+                scoped_flows = parser.extract_sequence_flows_for_process(exception_elem)
+                adjacency: Dict[str, List[str]] = {name: [] for name in child_names}
+                indegree: Dict[str, int] = {name: 0 for name in child_names}
+                for src, tgt, _ in scoped_flows:
+                    if src not in adjacency or tgt not in adjacency:
+                        continue
+                    if tgt not in adjacency[src]:
+                        adjacency[src].append(tgt)
+                        indegree[tgt] += 1
+
+                flow_steps: List[str] = []
+                queue = [name for name in child_names if indegree.get(name, 0) == 0]
+                while queue:
+                    current = queue.pop(0)
+                    flow_steps.append(current)
+                    for target in adjacency.get(current, []):
+                        indegree[target] -= 1
+                        if indegree[target] == 0:
+                            queue.append(target)
+                if flow_steps:
+                    ordered_steps = flow_steps
+
+            exception_name = str(exc.get("name") or f"Exception SubProcess {idx}").strip()
+            process_name = str(exc.get("process_name") or "").strip()
+            flow_name = f"{process_name} - {exception_name}" if process_name else exception_name
+
+            if not ordered_steps:
+                rows.append([
+                    flow_name,
+                    "Not identified",
+                    "Exception subprocess configured in the integration flow.",
+                ])
+                continue
+
+            for step_name in ordered_steps:
+                rows.append([
+                    flow_name,
+                    step_name,
+                    f"Executes the {step_name} step in the exception handling flow.",
+                ])
+        return rows
+
+    def combine_diagram_images(diagrams: List[Tuple[str, bytes]]) -> Optional[bytes]:
+        opened: List[Tuple[str, Image.Image]] = []
+        for title, image_bytes in diagrams:
+            if not image_bytes:
+                continue
+            try:
+                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            except Exception:
+                continue
+            opened.append((title, image))
+
+        if not opened:
+            return None
+
+        padding_x = 28
+        padding_y = 22
+        section_gap = 18
+        cell_width = min(1800, max(image.width for _, image in opened))
+        prepared: List[Tuple[str, Image.Image]] = []
+        for title, image in opened:
+            scale = min(1.0, cell_width / max(image.width, 1))
+            if scale < 1.0:
+                resized = image.resize(
+                    (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            else:
+                resized = image
+            prepared.append((title, resized))
+
+        canvas_w = padding_x * 2 + cell_width
+        canvas_h = padding_y * 2 + sum(image.height for _, image in prepared) + max(0, len(prepared) - 1) * section_gap
+        canvas = Image.new("RGB", (canvas_w, canvas_h), "white")
+
+        y = padding_y
+        for _, image in prepared:
+            image_x = padding_x + (cell_width - image.width) // 2
+            canvas.paste(image, (image_x, y))
+            y += image.height + section_gap
+
+        output = io.BytesIO()
+        canvas.save(output, format="PNG")
+        return output.getvalue()
+
+    def image_height_at_width(image_bytes: bytes, width_inches: float) -> Optional[float]:
+        try:
+            image = Image.open(io.BytesIO(image_bytes))
+            width_px, height_px = image.size
+            if width_px <= 0 or height_px <= 0:
+                return None
+            return width_inches * (height_px / width_px)
+        except Exception:
+            return None
+
+    def image_fits_at_width(image_bytes: bytes, width_inches: float, max_height_inches: float) -> bool:
+        display_height = image_height_at_width(image_bytes, width_inches)
+        return display_height is not None and display_height <= max_height_inches
+
+    def fit_image_width(image_bytes: bytes, max_width_inches: float = 6.2, max_height_inches: float = 8.0) -> float:
+        try:
+            image = Image.open(io.BytesIO(image_bytes))
+            width_px, height_px = image.size
+            if width_px <= 0 or height_px <= 0:
+                return max_width_inches
+            aspect_ratio = height_px / width_px
+            if aspect_ratio <= 0:
+                return max_width_inches
+            return max(1.0, min(max_width_inches, max_height_inches / aspect_ratio))
+        except Exception:
+            return max_width_inches
 
     def render_externalized_parameter_rows(values: Dict[str, str]) -> List[List[str]]:
         rows: List[List[str]] = []
@@ -1640,9 +1881,57 @@ def build_specification_document(
             [[src, tgt, name] for src, tgt, name in sequence_flows],
         )
 
-    if 'integration_flow' in diagram_bytes:
+    if 'integration_flow' in diagram_bytes or local_process_diagrams:
+        builder.add_page_break()
         builder.add_heading("4.3 Integration Flow Diagram", 2)
-        builder.add_image(diagram_bytes['integration_flow'], width=6.2, caption="Integration Flow Diagram")
+        builder.add_paragraph("This section shows the main integration flow together with the related local integration process diagrams.")
+        combined_diagram_sections: List[Tuple[str, bytes]] = []
+        if 'integration_flow' in diagram_bytes:
+            combined_diagram_sections.append(("Integration Flow", diagram_bytes['integration_flow']))
+        for process_name, image_bytes in local_process_diagrams:
+            combined_diagram_sections.append((f"Local Flow: {process_name}", image_bytes))
+        combined_diagram = combine_diagram_images(combined_diagram_sections)
+        section_image_max_height = 6.4
+        standalone_image_max_height = 7.4
+        combined_width = (
+            fit_image_width(combined_diagram, max_width_inches=6.2, max_height_inches=section_image_max_height)
+            if combined_diagram
+            else 0
+        )
+        if (
+            combined_diagram
+            and combined_width >= 4.2
+            and image_fits_at_width(combined_diagram, combined_width, section_image_max_height)
+        ):
+            builder.add_image(
+                combined_diagram,
+                width=combined_width,
+                caption="Integration Flow Diagram",
+            )
+        else:
+            if 'integration_flow' in diagram_bytes:
+                builder.add_image(
+                    diagram_bytes['integration_flow'],
+                    width=fit_image_width(
+                        diagram_bytes['integration_flow'],
+                        max_width_inches=6.2,
+                        max_height_inches=section_image_max_height,
+                    ),
+                    caption="Integration Flow Diagram",
+                )
+
+            for index, (process_name, image_bytes) in enumerate(local_process_diagrams):
+                if 'integration_flow' in diagram_bytes or index > 0:
+                    builder.add_page_break()
+                builder.add_image(
+                    image_bytes,
+                    width=fit_image_width(
+                        image_bytes,
+                        max_width_inches=6.2,
+                        max_height_inches=standalone_image_max_height,
+                    ),
+                    caption="Local Integration Process Flow Diagram",
+                )
 
     # 5. Technical Description
     print("   [7/10] Technical Description...")
@@ -1659,18 +1948,19 @@ def build_specification_document(
         processes: List[Dict[str, Any]],
         heading: str,
         process_diagrams: Optional[List[Tuple[str, bytes]]] = None,
+        local_mode: bool = False,
     ):
         builder.add_heading(heading, 2)
         if not processes:
             builder.add_paragraph("No processes available in this section.", italic=True)
             return
 
-        if process_diagrams:
+        if not local_mode and process_diagrams:
             for process_name, image_bytes in process_diagrams:
                 builder.add_image(image_bytes, width=5.8, caption=f"{process_name} Diagram")
 
         summary_rows = summarize_processes(processes)
-        if summary_rows:
+        if summary_rows and not local_mode:
             builder.add_table(["Process Name", "Sequence Flows", "Flow Elements"], summary_rows)
 
         for idx, process in enumerate(processes, start=1):
@@ -1683,6 +1973,29 @@ def build_specification_document(
                 description = fallback_process_description(process)
             if description:
                 builder.add_paragraph(description)
+
+            if local_mode and process_diagrams:
+                for process_name, image_bytes in process_diagrams:
+                    if str(process_name).strip() == str(proc_name).strip():
+                        builder.add_image(image_bytes, width=5.8, caption="Local Integration Process Flow Diagram")
+                        break
+
+            process_elem = process.get("element")
+            if process_elem is None:
+                continue
+
+            components = parser.extract_components_from_process(process_elem)
+            if components:
+                component_rows = filter_component_rows(components)
+                if component_rows:
+                    builder.add_table(["Component Name", "Key", "Value"], component_rows)
+
+            if local_mode:
+                detail_rows = build_local_process_detail_rows(process_elem)
+                if detail_rows:
+                    builder.add_heading("5.2.2 Local Integration Process Details", 3)
+                    builder.add_table(["#", "Step Name", "Type", "Description"], detail_rows)
+                continue
 
             key_activities = ai_entry.get("key_activities", []) if isinstance(ai_entry.get("key_activities"), list) else []
             if not key_activities:
@@ -1701,16 +2014,6 @@ def build_specification_document(
             if steps:
                 builder.add_table(["Step", "Description"], [[str(i + 1), str(step)] for i, step in enumerate(steps)])
 
-            process_elem = process.get("element")
-            if process_elem is None:
-                continue
-
-            components = parser.extract_components_from_process(process_elem)
-            if components:
-                component_rows = filter_component_rows(components)
-                if component_rows:
-                    builder.add_table(["Component Name", "Key", "Value"], component_rows)
-
             child_props = parser.extract_child_properties(process_elem)
             for child in child_props:
                 child_heading = child.get("heading", "").strip()
@@ -1722,13 +2025,13 @@ def build_specification_document(
                 if child_activity in {"mapping", "script"}:
                     continue
                 props = filter_display_rows(props)
-                if child_heading and props:
+                if child_heading and should_render_technical_child_properties(props):
                     builder.add_heading(f"{child_heading} Properties", 4)
                     builder.add_table(["Key", "Value"], props)
 
     render_process_block(main_processes, "5.1 Main Integration Process")
     if local_processes:
-        render_process_block(local_processes, "5.2 Local Integration Process", local_process_diagrams)
+        render_process_block(local_processes, "5.2 Local Integration Process", local_process_diagrams, local_mode=True)
 
     # Sender
     builder.add_heading("5.3 Sender", 2)
@@ -1770,23 +2073,71 @@ def build_specification_document(
     if receiver_description:
         builder.add_paragraph(receiver_description)
     receiver_summary_rows = build_adapter_summary_rows(receiver_prop_map, "receiver")
-    receiver_detail_rows = filter_detailed_property_rows(receiver_props, redundant_keys={
-        "address",
-        "soapwsdlurl",
-        "url",
-        "urlpath",
-        "host",
-        "alias",
-        "authentication",
-        "credentialname",
-        "usernametokencredentialname",
-        "accesskey",
-        "secretkey",
-        "operationname",
-        "operation",
-        "soapservicename",
-        "s3receiveroperation",
-    })
+    receiver_detail_rows = filter_detailed_property_rows(
+        receiver_props,
+        redundant_keys={
+            "headertable",
+            "propertytable",
+            "cmdvarianturi",
+        },
+        keep_keys={
+            "name",
+            "direction",
+            "componenttype",
+            "transportprotocolversion",
+            "messageprotocolversion",
+        },
+        preferred_order=[
+            "bucket name",
+            "archive bucket",
+            "folder name",
+            "archive folder",
+            "file name",
+            "read operation file name",
+            "list operation folder name",
+            "host",
+            "region name",
+            "address",
+            "alias",
+            "access key",
+            "secret key",
+            "component type",
+            "vendor",
+            "name",
+            "system",
+            "transport protocol",
+            "transport protocol version",
+            "message protocol",
+            "message protocol version",
+            "operation",
+            "s3 receiver operation",
+            "batch operation",
+            "batch mode",
+            "page size",
+            "query timeout",
+            "connection timeout",
+            "content type",
+            "content encoding",
+            "empty file handling",
+            "exist file handling",
+            "s3 append message id",
+            "s3 append timestamp",
+            "s3 server side encryption",
+            "s3 server side encryption for archive",
+            "s3 server side encryption customer key",
+            "s3 server side encryption customer key for archive",
+            "s3 server side encryption kms key id",
+            "s3 server side encryption kms key id for archive",
+            "s3 custom metadata table",
+            "s3 custom metadata table for archive",
+            "sorting for list operation",
+            "list operation include sub directories",
+            "connect via sdk",
+            "apply encryption when archiving",
+            "description",
+            "direction",
+        ],
+    )
     if receiver_summary_rows:
         builder.add_table(["Attribute", "Value"], receiver_summary_rows)
     if receiver_detail_rows:
@@ -1823,29 +2174,7 @@ def build_specification_document(
             ])
 
         if mapping_summary_rows:
-            builder.add_table(["Name", "2-Line Summary", "Mapping File Link"], mapping_summary_rows)
-
-        for idx, mapping in enumerate(mapping_props, start=1):
-            mapping_map = props_to_map(mapping)
-            mapping_name = (
-                mapping_map.get("mappingname")
-                or Path(mapping_map.get("mappinguri", "")).stem
-                or Path(mapping_map.get("mappingpath", "")).stem
-                or f"Mapping {idx}"
-            )
-            mapping_file = (
-                mapping_files_by_name.get(str(mapping_name).lower())
-                or mapping_map.get("mappinguri")
-                or mapping_map.get("mappingpath")
-                or "Not found in project artifacts"
-            )
-            builder.add_heading(str(mapping_name), 3, collapsed=True)
-            source_object, target_object = extract_mapping_relation(str(mapping_name), str(mapping_file))
-            mapping_relation_rows = [
-                ["Source Message / Object", source_object],
-                ["Target Message / Object", target_object],
-            ]
-            builder.add_table(["Attribute", "Value"], mapping_relation_rows)
+            builder.add_table(["Name", "Summary", "Mapping File Link"], mapping_summary_rows)
     else:
         builder.add_paragraph("No mapping activities found in this integration flow.", italic=True)
 
@@ -1855,7 +2184,7 @@ def build_specification_document(
     if security_ai:
         builder.add_table(["Security Aspect", "Details"], dict_to_rows(security_ai))
     if security_props:
-        filtered_security_rows = filter_display_rows(security_props)
+        filtered_security_rows = filter_security_rows(security_props)
         if filtered_security_rows:
             builder.add_table(["Key", "Value"], filtered_security_rows)
         elif not security_ai:
@@ -1910,30 +2239,47 @@ def build_specification_document(
     if error_ai:
         builder.add_table(["Aspect", "Details"], dict_to_rows(error_ai))
 
-    if 'exception_subprocess' in diagram_bytes:
-        builder.add_heading("Exception SubProcess Diagram", 3)
+    if exception_props:
+        builder.add_heading("Exception SubProcess Details", 3)
+        exception_diagrams_by_key = {
+            key: (label, image_bytes)
+            for key, label, image_bytes in exception_process_diagrams
+        }
+        for idx, exception in enumerate(exception_props, start=1):
+            if idx > 1:
+                builder.add_page_break()
+
+            exception_name = str(exception.get("name") or f"Exception SubProcess {idx}").strip()
+            process_name = str(exception.get("process_name") or "").strip()
+            label = f"{process_name} - {exception_name}" if process_name else exception_name
+            exception_key = str(exception.get("id") or f"{idx}:{label}")
+            _, image_bytes = exception_diagrams_by_key.get(exception_key, (label, None))
+
+            if image_bytes:
+                builder.add_image(
+                    image_bytes,
+                    width=fit_image_width(image_bytes, max_width_inches=5.8, max_height_inches=4.6),
+                    caption=f"{label} Diagram",
+                )
+
+            exception_summary_rows = build_exception_summary_rows([exception])
+            if exception_summary_rows:
+                builder.add_table(
+                    ["Exception Flow", "Key Steps", "Summary"],
+                    exception_summary_rows,
+                )
+    elif 'exception_subprocess' in diagram_bytes:
+        builder.add_heading("Exception SubProcess Details", 3)
         builder.add_image(
             diagram_bytes['exception_subprocess'],
-            width=5.4,
+            width=fit_image_width(diagram_bytes['exception_subprocess'], max_width_inches=5.8, max_height_inches=4.6),
             caption="Exception SubProcess Diagram",
         )
-
-    if exception_props:
-        for idx, exc in enumerate(exception_props, start=1):
-            builder.add_heading(f"Exception SubProcess {idx} Properties", 3)
-            sub_rows = filter_display_rows(exc.get("subproc_props", []))
-            if sub_rows:
-                builder.add_table(["Key", "Value"], sub_rows)
-
-            for child in exc.get("children", []):
-                child_rows = filter_display_rows(child.get("props", []))
-                if not child_rows:
-                    continue
-                child_title = f"Child Element: {child.get('tag', '')} {child.get('name', '')}".strip()
-                builder.add_heading(child_title, 4)
-                builder.add_table(["Key", "Value"], child_rows)
     else:
-        builder.add_paragraph("No exception subprocess configuration found.", italic=True)
+        builder.add_paragraph(
+            "No exception subprocess configuration found.",
+            italic=True,
+            )
 
     # 6. Version and Metadata
     print("   [8/10] Version and Metadata...")
